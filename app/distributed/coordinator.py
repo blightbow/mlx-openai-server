@@ -10,6 +10,52 @@ the coordinator, or the coordinator hangs forever.
 Solution: coordinator broadcasts tokens and parameters before each
 generate() call. Workers loop waiting for broadcasts and participate
 in inference, discarding their output.
+
+CRITICAL IMPLEMENTATION NOTE - WHY WE USE all_sum() INSTEAD OF send()/recv_like():
+================================================================================
+
+We use all_sum() as a broadcast mechanism instead of point-to-point send/recv
+operations. This is NOT a design choice - it's a WORKAROUND for a known issue.
+
+THE PROBLEM:
+    mx.distributed.send() and recv_like() crash with SIGBUS (signal 138) when
+    there is asymmetric timing between sender and receiver over JACCL (Thunderbolt
+    RDMA). In HTTP serving, workers block on recv_like() waiting for requests while
+    the coordinator only sends when an HTTP request arrives - this timing mismatch
+    triggers the crash.
+
+    We experienced this firsthand: worker blocked ~17 seconds on recv_like(),
+    coordinator called send() after HTTP request arrived, worker crashed with SIGBUS.
+
+    Attempted fixes that DID NOT WORK:
+    - Adding mx.eval() after send/recv operations
+    - Using mx.synchronize()
+    - Passing explicit group= parameter to send/recv
+    - Using CPU stream
+
+THIS IS A KNOWN ISSUE:
+    - GitHub Issue #1849: "Issue with mx.distributed send and recv"
+      https://github.com/ml-explore/mlx/issues/1849
+      Reporter experienced identical symptoms - send/recv fails, all_sum works.
+
+    - MLX documentation emphasizes all_sum/all_gather as primary operations.
+      WWDC 2025 MLX session only demonstrates all_sum - doesn't mention send/recv.
+
+    - Jeff Geerling reported RDMA crashes during testing:
+      https://www.jeffgeerling.com/blog/2025/15-tb-vram-on-mac-studio-rdma-over-thunderbolt-5
+
+THE SOLUTION:
+    Use all_sum() with a zero-contribution pattern:
+    - Coordinator contributes actual data
+    - Workers contribute zeros
+    - Result: data + 0 + 0 + ... = data (everyone gets coordinator's data)
+
+    This works because all_sum() is synchronous by design - all ranks must call
+    it together, avoiding the "idle receiver" timing issue. Model sharding
+    internally uses all_sum() and works reliably over JACCL.
+
+DO NOT REFACTOR THIS TO USE send()/recv_like() WITHOUT VERIFYING THE UNDERLYING
+ISSUE HAS BEEN FIXED IN MLX. The all_sum pattern is intentional and mission-critical.
 """
 
 from typing import Generator
@@ -82,8 +128,12 @@ class DistributedCoordinator:
             repetition_penalty: Repetition penalty factor
             repetition_context_size: Context size for repetition penalty
         """
-        # Use all_sum as broadcast: rank 0 sends data, others send zeros
-        # This uses collective ops which work reliably with JACCL
+        # CRITICAL: We use all_sum as broadcast instead of send/recv.
+        # send()/recv_like() crash with SIGBUS over JACCL when timing is asymmetric.
+        # See module docstring for full explanation and issue references.
+        #
+        # Pattern: rank 0 contributes data, workers contribute zeros
+        # Result: data + 0 + 0 = data (everyone gets coordinator's data)
 
         # Broadcast token length
         length = mx.array([len(tokens)], dtype=mx.int32)
@@ -147,15 +197,21 @@ def run_worker_loop(
     rank = group.rank()
     logger.info(f"[Rank {rank}] Starting worker loop, waiting for coordinator")
 
-    # Templates for recv_like (must match coordinator's send shapes)
+    # Zero templates for the all_sum broadcast pattern.
+    # Workers contribute zeros; when summed with coordinator's data, result = coordinator's data.
+    # DO NOT change to recv_like() - see module docstring for SIGBUS crash details.
     length_template = mx.zeros((1,), dtype=mx.int32)
     token_template = mx.zeros((MAX_PROMPT_LENGTH,), dtype=mx.int32)
     param_template = mx.zeros((PARAM_COUNT,), dtype=mx.float32)
 
     while True:
         try:
-            # Use all_sum as broadcast: contribute zeros, receive coordinator's data
-            # This uses collective ops which work reliably with JACCL
+            # CRITICAL: We use all_sum as broadcast instead of recv_like.
+            # recv_like() crashes with SIGBUS when we wait here for extended periods.
+            # See module docstring for full explanation and GitHub issue references.
+            #
+            # Pattern: we contribute zeros, coordinator contributes data
+            # Result: 0 + data = data (we receive coordinator's data)
 
             # Receive token length (all_sum with our zeros)
             logger.debug(f"[Rank {rank}] Waiting for token length (all_sum)...")
