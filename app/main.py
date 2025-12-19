@@ -15,6 +15,11 @@ Run the default launch flow:
 Forward explicit arguments to the CLI:
 
     python -m app.main launch --port 8000
+
+Distributed inference (via mlx.launch):
+
+    mlx.launch --backend jaccl --hostfile cluster.json -- \\
+        python -m app.main launch --model-path <model> --distributed=tensor
 """
 
 import sys
@@ -84,8 +89,50 @@ async def start(config: MLXServerConfig) -> None:
     routine, logs progress, and starts the Uvicorn server. It handles
     KeyboardInterrupt and logs any startup failures before exiting the
     process with a non-zero code.
+
+    In distributed mode:
+    - Rank 0 (coordinator): Serves HTTP and broadcasts tokens to workers
+    - Rank > 0 (workers): Load model shard, participate in inference via worker loop
     """
     try:
+        # Handle distributed mode: workers run inference loop, not HTTP server
+        if config.distributed:
+            import mlx.core as mx
+
+            from .distributed import run_worker_loop
+            from .models.mlx_lm import MLX_LM
+
+            # Check rank before loading model to avoid loading on coordinator
+            # (coordinator will load via setup_server -> handler)
+            group = mx.distributed.init()
+            rank = group.rank()
+
+            if rank != 0:
+                # Workers load model and run inference loop
+                logger.info(f"[Rank {rank}] Worker mode - loading model shard")
+                mlx_lm = MLX_LM(
+                    model_path=config.model_path,
+                    context_length=config.context_length,
+                    trust_remote_code=config.trust_remote_code,
+                    chat_template_file=config.chat_template_file,
+                    distributed=config.distributed,
+                )
+                logger.info(f"[Rank {rank}] Entering inference loop")
+                # Worker loop is blocking (runs forever)
+                run_worker_loop(
+                    model=mlx_lm.model,
+                    tokenizer=mlx_lm.tokenizer,
+                    group=mlx_lm.group,
+                    max_kv_size=mlx_lm.max_kv_size,
+                )
+                return  # Never reached, but explicit
+
+            # Rank 0 continues to serve HTTP (model loaded in setup_server)
+            logger.info(
+                f"[Rank 0] Coordinator mode - starting HTTP server "
+                f"(distributed={config.distributed})"
+            )
+
         # Display startup information
         print_startup_banner(config)
 

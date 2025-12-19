@@ -186,9 +186,10 @@ def cli():
     help="Path to a custom chat template file. Only works with language models (lm) and multimodal models.",
 )
 @click.option(
-    "--pipeline",
-    is_flag=True,
-    help="Use pipeline parallel mode for distributed inference. Only works with language models (lm) model type.",
+    "--distributed",
+    type=click.Choice(["tensor", "pipeline"]),
+    default=None,
+    help="Enable distributed inference. 'tensor' shards weights within layers (best for TB5 RDMA). 'pipeline' shards between layers. Requires mlx.launch wrapper.",
 )
 def launch(
     model_path,
@@ -212,7 +213,7 @@ def launch(
     reasoning_parser,
     trust_remote_code,
     chat_template_file,
-    pipeline,
+    distributed,
 ) -> None:
     """Start the FastAPI/Uvicorn server with the supplied flags.
 
@@ -243,7 +244,7 @@ def launch(
         reasoning_parser=reasoning_parser,
         trust_remote_code=trust_remote_code,
         chat_template_file=chat_template_file,
-        pipeline=pipeline,
+        distributed=distributed,
     )
 
     asyncio.run(start(args))

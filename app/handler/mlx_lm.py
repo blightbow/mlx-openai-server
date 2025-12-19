@@ -19,10 +19,21 @@ class MLXLMHandler:
     Provides request queuing, metrics tracking, and robust error handling.
     """
 
-    def __init__(self, model_path: str, context_length: int = 32768, max_concurrency: int = 1, enable_auto_tool_choice: bool = False, tool_call_parser: str = None, reasoning_parser: str = None, trust_remote_code: bool = False, chat_template_file: str = None, pipeline: bool = False):
+    def __init__(
+        self,
+        model_path: str,
+        context_length: int = 32768,
+        max_concurrency: int = 1,
+        enable_auto_tool_choice: bool = False,
+        tool_call_parser: str = None,
+        reasoning_parser: str = None,
+        trust_remote_code: bool = False,
+        chat_template_file: str = None,
+        distributed: str = None,
+    ):
         """
         Initialize the handler with the specified model path.
-        
+
         Args:
             model_path (str): Path to the model directory.
             context_length (int): Maximum context length for the model.
@@ -32,10 +43,16 @@ class MLXLMHandler:
             reasoning_parser (str): Name of the reasoning parser to use (qwen3, qwen3_next, glm4_moe, harmony, minimax, ...)
             trust_remote_code (bool): Enable trust_remote_code when loading models.
             chat_template_file (str): Path to a custom chat template file.
-            pipeline (bool): Use pipeline parallel mode for distributed inference.
+            distributed (str): Distributed mode - "tensor" or "pipeline", None for non-distributed.
         """
         self.model_path = model_path
-        self.model = MLX_LM(model_path, context_length, trust_remote_code=trust_remote_code, chat_template_file=chat_template_file, pipeline=pipeline)
+        self.model = MLX_LM(
+            model_path,
+            context_length,
+            trust_remote_code=trust_remote_code,
+            chat_template_file=chat_template_file,
+            distributed=distributed,
+        )
         self.model_created = int(time.time())  # Store creation time when model is loaded
         self.model_type = self.model.get_model_type()
         

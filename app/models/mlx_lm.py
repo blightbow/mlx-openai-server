@@ -1,16 +1,16 @@
 import gc
 import os
+from typing import Dict, Generator, List, Union
+
 import mlx.core as mx
-from mlx_lm.utils import load, pipeline_load
-from mlx_lm.generate import (
-    generate,
-    stream_generate,
-)
-from outlines.processors import JSONLogitsProcessor
+from loguru import logger
+from mlx_lm.generate import generate, stream_generate
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.sample_utils import make_sampler, make_logits_processors
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
+from mlx_lm.utils import load, sharded_load
+from outlines.processors import JSONLogitsProcessor
+
 from ..utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
-from typing import List, Dict, Union, Generator
 
 DEFAULT_TEMPERATURE = os.getenv("DEFAULT_TEMPERATURE", 0.7)
 DEFAULT_TOP_P = os.getenv("DEFAULT_TOP_P", 0.95)
@@ -23,18 +23,38 @@ DEFAULT_BATCH_SIZE = os.getenv("DEFAULT_BATCH_SIZE", 32)
 class MLX_LM:
     """
     A wrapper class for MLX Language Model that handles both streaming and non-streaming inference.
-    
+
     This class provides a unified interface for generating text responses from text prompts,
     supporting both streaming and non-streaming modes.
+
+    For distributed inference, the group is initialized BEFORE model loading so that
+    sharded_load() can properly distribute weights across ranks.
     """
 
-    def __init__(self, model_path: str, context_length: int = 32768, trust_remote_code: bool = False, chat_template_file: str = None, pipeline: bool = False):
+    def __init__(
+        self,
+        model_path: str,
+        context_length: int = 32768,
+        trust_remote_code: bool = False,
+        chat_template_file: str = None,
+        distributed: str = None,
+    ):
         try:
-            self.pipeline = pipeline
-            self.model, self.tokenizer = self._initialize_model(model_path)
-            if self.pipeline:
+            self.distributed = distributed
+            self.group = None
+            self.rank = 0
+
+            # CRITICAL: Initialize distributed group BEFORE model loading
+            # sharded_load() needs the group to distribute weights correctly
+            if self.distributed:
                 self.group = mx.distributed.init()
                 self.rank = self.group.rank()
+                logger.info(
+                    f"[Rank {self.rank}] Distributed mode: {self.distributed}, "
+                    f"group size: {self.group.size()}"
+                )
+
+            self.model, self.tokenizer = self._initialize_model(model_path, trust_remote_code)
             self.pad_token_id = self.tokenizer.pad_token_id
             self.bos_token = self.tokenizer.bos_token
             self.model_type = self.model.model_type
@@ -49,9 +69,17 @@ class MLX_LM:
             raise ValueError(f"Error loading model: {str(e)}")
 
     def _initialize_model(self, model_path: str, trust_remote_code: bool = False):
-        if self.pipeline:
-            return pipeline_load(model_path)
-        return load(model_path, lazy=False, tokenizer_config = {"trust_remote_code": trust_remote_code})
+        if self.distributed:
+            # sharded_load(path, pipeline_group, tensor_group)
+            # - tensor: shard weights within layers -> pass (None, group)
+            # - pipeline: shard weights between layers -> pass (group, None)
+            if self.distributed == "pipeline":
+                logger.info(f"[Rank {self.rank}] Using pipeline parallelism")
+                return sharded_load(model_path, self.group, None)
+            else:  # tensor (default)
+                logger.info(f"[Rank {self.rank}] Using tensor parallelism")
+                return sharded_load(model_path, None, self.group)
+        return load(model_path, lazy=False, tokenizer_config={"trust_remote_code": trust_remote_code})
         
     def _apply_pooling_strategy(self, embeddings: mx.array) -> mx.array:
         embeddings = mx.mean(embeddings, axis=1)
@@ -197,12 +225,29 @@ class MLX_LM:
             messages,
             add_generation_prompt=True,
             **chat_template_kwargs,
-        )      
-
-        sampler = make_sampler(
-           **sampler_kwargs
         )
-                
+
+        # In distributed mode (coordinator/rank 0), broadcast tokens to workers
+        # Workers are running the inference loop and waiting for these tokens
+        if self.distributed and self.rank == 0:
+            from ..distributed import DistributedCoordinator
+
+            coordinator = DistributedCoordinator(self.group)
+            coordinator.broadcast_request(
+                tokens=input_tokens,
+                max_tokens=max_tokens,
+                temperature=sampler_kwargs["temp"],
+                top_p=sampler_kwargs["top_p"],
+                top_k=sampler_kwargs["top_k"],
+                min_p=sampler_kwargs["min_p"],
+                seed=seed,
+                repetition_penalty=repetition_penalty,
+                repetition_context_size=repetition_context_size,
+            )
+            logger.debug(f"[Rank 0] Broadcast {len(input_tokens)} tokens to workers")
+
+        sampler = make_sampler(**sampler_kwargs)
+
         prompt_tokens = len(input_tokens)
 
         if not stream:
