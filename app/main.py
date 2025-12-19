@@ -108,6 +108,15 @@ async def start(config: MLXServerConfig) -> None:
             rank = group.rank()
 
             if rank != 0:
+                # Configure logging for worker (setup_server not called for workers)
+                from .server import configure_logging
+
+                configure_logging(
+                    log_file=config.log_file,
+                    no_log_file=config.no_log_file,
+                    log_level=config.log_level,
+                )
+
                 # Workers load model and run inference loop
                 logger.info(f"[Rank {rank}] Worker mode - loading model shard")
                 mlx_lm = MLX_LM(
