@@ -85,7 +85,7 @@ class DistributedCoordinator:
         # Send token length first
         length = mx.array([len(tokens)], dtype=mx.int32)
         for dst in range(1, self.size):
-            mx.distributed.send(length, dst=dst)
+            mx.distributed.send(length, dst=dst, group=self.group)
         mx.eval(length)  # Ensure length send completes before tokens
 
         # Pad tokens to fixed size and send
@@ -98,7 +98,7 @@ class DistributedCoordinator:
             padded = token_array[:MAX_PROMPT_LENGTH]
 
         for dst in range(1, self.size):
-            mx.distributed.send(padded, dst=dst)
+            mx.distributed.send(padded, dst=dst, group=self.group)
         mx.eval(padded)  # Ensure token send completes before params
 
         # Send generation parameters
@@ -116,7 +116,7 @@ class DistributedCoordinator:
             dtype=mx.float32,
         )
         for dst in range(1, self.size):
-            mx.distributed.send(params, dst=dst)
+            mx.distributed.send(params, dst=dst, group=self.group)
         mx.eval(params)  # Ensure params send completes before generate()
 
         logger.debug(
@@ -156,7 +156,7 @@ def run_worker_loop(
         try:
             # Receive token length
             logger.debug(f"[Rank {rank}] Waiting for token length...")
-            length = mx.distributed.recv_like(length_template, src=0)
+            length = mx.distributed.recv_like(length_template, src=0, group=group)
             logger.debug(f"[Rank {rank}] recv_like returned, calling eval...")
             mx.eval(length)
             actual_length = int(length[0].item())
@@ -164,14 +164,14 @@ def run_worker_loop(
 
             # Receive padded tokens
             logger.debug(f"[Rank {rank}] Waiting for tokens...")
-            tokens = mx.distributed.recv_like(token_template, src=0)
+            tokens = mx.distributed.recv_like(token_template, src=0, group=group)
             logger.debug(f"[Rank {rank}] recv_like returned, calling eval...")
             mx.eval(tokens)
             logger.debug(f"[Rank {rank}] Received tokens")
 
             # Receive generation parameters
             logger.debug(f"[Rank {rank}] Waiting for params...")
-            params = mx.distributed.recv_like(param_template, src=0)
+            params = mx.distributed.recv_like(param_template, src=0, group=group)
             logger.debug(f"[Rank {rank}] recv_like returned, calling eval...")
             mx.eval(params)
             logger.debug(f"[Rank {rank}] Received params")
