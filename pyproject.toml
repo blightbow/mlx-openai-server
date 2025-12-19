@@ -32,7 +32,7 @@ dependencies = [
   "mflux>=0.13.2,<0.14",
   "loguru>=0.7.3,<0.8",
   "mlx-embeddings>=0.0.4,<0.1",
-  "mlx-lm>=0.29.0,<0.30",
+  "mlx-lm>=0.30.0,<0.31",
   "mlx-vlm>=0.3.9,<0.4",
   "mlx-whisper>=0.4.3,<0.5",
   "mlx>=0.30",                        # Needed due to a typing issue in <0.30
@@ -52,7 +52,9 @@ dev = [
   "codespell",
   "mypy",
   "pre-commit",
-  "pytest",
+  "pytest>=8.0",
+  "pytest-asyncio>=0.24",
+  "pytest-mock>=3.12",
   "ruff",
   "types-aiofiles",
   "types-cffi",
@@ -94,9 +96,14 @@ skip = "*.py,*.toml,*.ipynb"
 quiet-level = 3
 
 [tool.pytest.ini_options]
-addopts = "--tb=short"
+testpaths = ["tests"]
+addopts = "--tb=short --strict-markers"
 markers = [
   "integration: marks tests as integration tests that require external services",
+  "distributed: marks tests requiring multi-node distributed setup",
+  "pipeline: marks tests exercising pipeline parallel mode",
+  "rdma: marks tests requiring RDMA/JACCL backend (Thunderbolt 5)",
+  "slow: marks tests as slow running",
 ]
 
 [tool.ruff]

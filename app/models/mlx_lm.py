@@ -1,16 +1,24 @@
 import gc
 import os
+from typing import Dict, Generator, List, Union
+
 import mlx.core as mx
-from mlx_lm.utils import load, sharded_load
 from mlx_lm.generate import (
     generate,
     stream_generate,
 )
-from outlines.processors import JSONLogitsProcessor
 from mlx_lm.models.cache import make_prompt_cache
-from mlx_lm.sample_utils import make_sampler, make_logits_processors
+from mlx_lm.sample_utils import make_logits_processors, make_sampler
+from mlx_lm.utils import load
+from outlines.processors import JSONLogitsProcessor
+
 from ..utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
-from typing import List, Dict, Union, Generator
+
+# sharded_load is only available in mlx-lm >= 0.30.0
+try:
+    from mlx_lm.utils import sharded_load
+except ImportError:
+    sharded_load = None  # type: ignore[assignment, misc]
 
 DEFAULT_TEMPERATURE = os.getenv("DEFAULT_TEMPERATURE", 0.7)
 DEFAULT_TOP_P = os.getenv("DEFAULT_TOP_P", 0.95)
@@ -55,6 +63,11 @@ class MLX_LM:
 
     def _initialize_model(self, model_path: str):
         if self.pipeline:
+            if sharded_load is None:
+                raise ImportError(
+                    "Pipeline mode requires mlx-lm >= 0.30.0 with sharded_load support. "
+                    "Install with: pip install 'mlx-lm>=0.30.0'"
+                )
             # Note: sharded_load() doesn't support tokenizer_config passthrough.
             # trust_remote_code is not applied in pipeline mode (mlx-lm limitation).
             return sharded_load(model_path, self.group, self.group)

@@ -1,10 +1,13 @@
-"""Universal API contract test suite for the MLX OpenAI-compatible server."""
+"""Universal API contract test suite for the MLX OpenAI-compatible server.
+
+Session-scoped fixtures (base_url, headers, http_client, model_id, server_available)
+are defined in conftest.py for sharing across test modules.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Iterable
 import json
-import os
 from typing import Literal
 
 import pytest
@@ -126,73 +129,8 @@ class ChatCompletionChunk(BaseModel):
 
 
 # --------------------------------------------------------------------------------------
-
-
-def env_base_url() -> str:
-    """
-    Get the base URL for the MLX server from environment variables.
-
-    Returns
-    -------
-    str
-        The base URL with trailing slash removed.
-    """
-    raw = os.getenv("MLX_URL", "http://127.0.0.1:8000")
-    return raw.rstrip("/")
-
-
-def build_headers() -> dict[str, str]:
-    """
-    Build HTTP headers for API requests.
-
-    Uses API key from OPENAI_API_KEY or MLX_API_KEY environment variables.
-
-    Returns
-    -------
-    dict[str, str]
-        Dictionary containing Authorization header if API key is available.
-    """
-    api_key = os.getenv("OPENAI_API_KEY") or os.getenv("MLX_API_KEY")
-    if api_key:
-        return {"Authorization": f"Bearer {api_key}"}
-    return {}
-
-
-@pytest.fixture(scope="session")
-def base_url() -> str:
-    """Fixture providing the base URL for the MLX server."""
-    return env_base_url()
-
-
-@pytest.fixture(scope="session")
-def headers() -> dict[str, str]:
-    """Fixture providing HTTP headers for API requests."""
-    return build_headers()
-
-
-@pytest.fixture(scope="session")
-def http_client(base_url: str, headers: dict[str, str]) -> httpx.Client:
-    """Fixture providing an HTTP client configured for the MLX server."""
-    client = httpx.Client(base_url=base_url, timeout=30.0, headers=headers)
-    yield client
-    client.close()
-
-
-@pytest.fixture(scope="session")
-def model_id() -> str | None:
-    """Fixture providing the model ID from environment variables."""
-    return os.getenv("MLX_MODEL_ID")
-
-
-@pytest.fixture(scope="session")
-def server_available(http_client: httpx.Client) -> bool:
-    """Fixture that checks if the MLX server is available."""
-    try:
-        response = http_client.get("/health", timeout=5.0)
-    except (httpx.ConnectError, httpx.TimeoutException):
-        return False
-    else:
-        return response.status_code == 200
+# Test Classes
+# --------------------------------------------------------------------------------------
 
 
 class TestLLMContract:
