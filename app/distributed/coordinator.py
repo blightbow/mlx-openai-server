@@ -82,26 +82,27 @@ class DistributedCoordinator:
             repetition_penalty: Repetition penalty factor
             repetition_context_size: Context size for repetition penalty
         """
-        # Send token length first
-        length = mx.array([len(tokens)], dtype=mx.int32)
-        for dst in range(1, self.size):
-            mx.distributed.send(length, dst=dst, group=self.group)
-        mx.eval(length)  # Ensure length send completes before tokens
+        # Use all_sum as broadcast: rank 0 sends data, others send zeros
+        # This uses collective ops which work reliably with JACCL
 
-        # Pad tokens to fixed size and send
+        # Broadcast token length
+        length = mx.array([len(tokens)], dtype=mx.int32)
+        # all_sum: rank 0 contributes length, others contribute 0
+        length_broadcast = mx.distributed.all_sum(length, group=self.group)
+        mx.eval(length_broadcast)
+
+        # Pad tokens to fixed size and broadcast
         padded = mx.zeros((MAX_PROMPT_LENGTH,), dtype=mx.int32)
         token_array = mx.array(tokens, dtype=mx.int32)
-        # MLX doesn't support slice assignment, so we concatenate
         if len(tokens) < MAX_PROMPT_LENGTH:
             padded = mx.concatenate([token_array, mx.zeros((MAX_PROMPT_LENGTH - len(tokens),), dtype=mx.int32)])
         else:
             padded = token_array[:MAX_PROMPT_LENGTH]
 
-        for dst in range(1, self.size):
-            mx.distributed.send(padded, dst=dst, group=self.group)
-        mx.eval(padded)  # Ensure token send completes before params
+        tokens_broadcast = mx.distributed.all_sum(padded, group=self.group)
+        mx.eval(tokens_broadcast)
 
-        # Send generation parameters
+        # Broadcast generation parameters
         params = mx.array(
             [
                 float(max_tokens),
@@ -115,9 +116,8 @@ class DistributedCoordinator:
             ],
             dtype=mx.float32,
         )
-        for dst in range(1, self.size):
-            mx.distributed.send(params, dst=dst, group=self.group)
-        mx.eval(params)  # Ensure params send completes before generate()
+        params_broadcast = mx.distributed.all_sum(params, group=self.group)
+        mx.eval(params_broadcast)
 
         logger.debug(
             f"[Rank 0] Broadcast {len(tokens)} tokens to {self.size - 1} workers"
@@ -154,25 +154,25 @@ def run_worker_loop(
 
     while True:
         try:
-            # Receive token length
-            logger.debug(f"[Rank {rank}] Waiting for token length...")
-            length = mx.distributed.recv_like(length_template, src=0, group=group)
-            logger.debug(f"[Rank {rank}] recv_like returned, calling eval...")
+            # Use all_sum as broadcast: contribute zeros, receive coordinator's data
+            # This uses collective ops which work reliably with JACCL
+
+            # Receive token length (all_sum with our zeros)
+            logger.debug(f"[Rank {rank}] Waiting for token length (all_sum)...")
+            length = mx.distributed.all_sum(length_template, group=group)
             mx.eval(length)
             actual_length = int(length[0].item())
             logger.debug(f"[Rank {rank}] Received length: {actual_length}")
 
             # Receive padded tokens
-            logger.debug(f"[Rank {rank}] Waiting for tokens...")
-            tokens = mx.distributed.recv_like(token_template, src=0, group=group)
-            logger.debug(f"[Rank {rank}] recv_like returned, calling eval...")
+            logger.debug(f"[Rank {rank}] Waiting for tokens (all_sum)...")
+            tokens = mx.distributed.all_sum(token_template, group=group)
             mx.eval(tokens)
             logger.debug(f"[Rank {rank}] Received tokens")
 
             # Receive generation parameters
-            logger.debug(f"[Rank {rank}] Waiting for params...")
-            params = mx.distributed.recv_like(param_template, src=0, group=group)
-            logger.debug(f"[Rank {rank}] recv_like returned, calling eval...")
+            logger.debug(f"[Rank {rank}] Waiting for params (all_sum)...")
+            params = mx.distributed.all_sum(param_template, group=group)
             mx.eval(params)
             logger.debug(f"[Rank {rank}] Received params")
 
