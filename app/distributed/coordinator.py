@@ -155,17 +155,26 @@ def run_worker_loop(
     while True:
         try:
             # Receive token length
+            logger.debug(f"[Rank {rank}] Waiting for token length...")
             length = mx.distributed.recv_like(length_template, src=0)
+            logger.debug(f"[Rank {rank}] recv_like returned, calling eval...")
             mx.eval(length)
             actual_length = int(length[0].item())
+            logger.debug(f"[Rank {rank}] Received length: {actual_length}")
 
             # Receive padded tokens
+            logger.debug(f"[Rank {rank}] Waiting for tokens...")
             tokens = mx.distributed.recv_like(token_template, src=0)
+            logger.debug(f"[Rank {rank}] recv_like returned, calling eval...")
             mx.eval(tokens)
+            logger.debug(f"[Rank {rank}] Received tokens")
 
             # Receive generation parameters
+            logger.debug(f"[Rank {rank}] Waiting for params...")
             params = mx.distributed.recv_like(param_template, src=0)
+            logger.debug(f"[Rank {rank}] recv_like returned, calling eval...")
             mx.eval(params)
+            logger.debug(f"[Rank {rank}] Received params")
 
             # Extract parameters
             max_tokens = int(params[0].item())
