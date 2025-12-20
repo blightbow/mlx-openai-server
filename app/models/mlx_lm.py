@@ -73,12 +73,34 @@ class MLX_LM:
             # sharded_load(path, pipeline_group, tensor_group)
             # - tensor: shard weights within layers -> pass (None, group)
             # - pipeline: shard weights between layers -> pass (group, None)
-            if self.distributed == "pipeline":
-                logger.info(f"[Rank {self.rank}] Using pipeline parallelism")
-                return sharded_load(model_path, self.group, None)
-            else:  # tensor (default)
-                logger.info(f"[Rank {self.rank}] Using tensor parallelism")
-                return sharded_load(model_path, None, self.group)
+            try:
+                if self.distributed == "pipeline":
+                    logger.info(f"[Rank {self.rank}] Using pipeline parallelism")
+                    return sharded_load(model_path, self.group, None)
+                else:  # tensor (default)
+                    logger.info(f"[Rank {self.rank}] Using tensor parallelism")
+                    return sharded_load(model_path, None, self.group)
+            except ValueError as e:
+                error_msg = str(e)
+                if "does not support pipelining" in error_msg:
+                    raise ValueError(
+                        f"Model does not support pipeline parallelism. "
+                        f"Try --distributed=tensor instead. See mlx-lm documentation "
+                        f"for supported model architectures."
+                    ) from e
+                elif "does not support any sharding" in error_msg:
+                    raise ValueError(
+                        f"Model does not support distributed inference. "
+                        f"See mlx-lm documentation for supported model architectures."
+                    ) from e
+                elif "does not support" in error_msg and "tensor" in error_msg.lower():
+                    raise ValueError(
+                        f"Model does not support tensor parallelism. "
+                        f"Try --distributed=pipeline instead. See mlx-lm documentation "
+                        f"for supported model architectures."
+                    ) from e
+                else:
+                    raise
         return load(model_path, lazy=False, tokenizer_config={"trust_remote_code": trust_remote_code})
         
     def _apply_pooling_strategy(self, embeddings: mx.array) -> mx.array:
