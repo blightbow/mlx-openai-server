@@ -28,14 +28,85 @@ import mlx.core as mx
 import numpy as np
 from loguru import logger
 
-# Transfer chunk size: 256 MB balances throughput vs memory
-CHUNK_SIZE = 256 * 1024 * 1024
+# Chunk size limits by backend
+CHUNK_SIZE_MPI = 256 * 1024 * 1024      # 256 MB (MPI int32 limit safety margin)
+CHUNK_SIZE_RING = 512 * 1024 * 1024     # 512 MB (balance blocking time vs overhead)
+CHUNK_SIZE_JACCL = 1024 * 1024 * 1024   # 1 GB (TB5 RDMA handles large chunks well)
 
 # Maximum filename length for manifest broadcast
 MAX_FILENAME_LENGTH = 256
 
 # Maximum files in manifest (should be plenty for any model)
 MAX_MANIFEST_FILES = 100
+
+
+def detect_backend() -> str:
+    """Detect which mlx.launch backend is in use.
+
+    Uses heuristics based on environment variables set by mlx.launch.
+
+    Returns:
+        Backend name: "jaccl", "ring", "mpi", or "unknown"
+    """
+    # Check for explicit environment variable override
+    backend = os.getenv("MLX_DISTRIBUTED_BACKEND", "").lower()
+    if backend in ("jaccl", "ring", "mpi", "nccl"):
+        return backend
+
+    # Check for MPI environment variables
+    if any(key.startswith(("OMPI_", "PMI_", "MPI_")) for key in os.environ):
+        return "mpi"
+
+    # Check for JACCL-specific indicators
+    # JACCL uses MLX_HOSTFILE and typically has high connection counts
+    if os.getenv("MLX_HOSTFILE"):
+        # If connections_per_ip is high (>1), likely JACCL
+        # Ring backend typically uses 1 connection
+        # For now, we can't reliably distinguish without more info
+        # Default to ring if hostfile is present
+        return "ring"
+
+    # Unable to detect
+    return "unknown"
+
+
+def get_chunk_size(backend: Optional[str] = None) -> int:
+    """Get optimal chunk size based on backend.
+
+    Args:
+        backend: Backend name or None to auto-detect
+
+    Returns:
+        Chunk size in bytes
+    """
+    # Allow environment variable override
+    override = os.getenv("MLX_FILE_SYNC_CHUNK_SIZE")
+    if override:
+        try:
+            return int(override)
+        except ValueError:
+            logger.warning(
+                f"Invalid MLX_FILE_SYNC_CHUNK_SIZE={override}, using default"
+            )
+
+    # Detect backend if not provided
+    if backend is None:
+        backend = detect_backend()
+
+    # Select chunk size based on backend
+    chunk_sizes = {
+        "jaccl": CHUNK_SIZE_JACCL,   # 1 GB - TB5 RDMA handles it
+        "ring": CHUNK_SIZE_RING,     # 512 MB - balance overhead vs blocking
+        "mpi": CHUNK_SIZE_MPI,       # 256 MB - MPI int32 limit
+        "nccl": CHUNK_SIZE_MPI,      # 256 MB - conservative
+        "unknown": CHUNK_SIZE_MPI,   # 256 MB - conservative fallback
+    }
+
+    chunk_size = chunk_sizes.get(backend, CHUNK_SIZE_MPI)
+    logger.debug(
+        f"Using chunk size {chunk_size / 1024 / 1024:.0f}MB for backend={backend}"
+    )
+    return chunk_size
 
 
 class FileSyncError(Exception):
@@ -201,25 +272,28 @@ def transfer_file(
     dst_path: Path,
     file_size: int,
     group: mx.distributed.Group,
+    chunk_size: int,
 ) -> None:
     """Transfer a single file from rank 0 to all workers.
 
-    Uses chunked all_sum transfers to handle large files within MPI limits.
+    Uses chunked all_sum transfers to handle large files.
 
     Args:
         src_path: Source file path (rank 0 only, None for workers)
         dst_path: Destination file path
         file_size: Expected file size in bytes
         group: MLX distributed group
+        chunk_size: Size of each transfer chunk in bytes
     """
     rank = group.rank()
 
     # Calculate chunks
-    num_chunks = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
+    num_chunks = (file_size + chunk_size - 1) // chunk_size
 
     logger.debug(
         f"[Rank {rank}] Transferring {dst_path.name}: "
-        f"{file_size / 1e6:.1f}MB in {num_chunks} chunks"
+        f"{file_size / 1e6:.1f}MB in {num_chunks} chunks "
+        f"({chunk_size / 1e6:.0f}MB each)"
     )
 
     # Open files
@@ -237,17 +311,17 @@ def transfer_file(
         for chunk_idx in range(num_chunks):
             # Calculate chunk size (last chunk may be smaller)
             remaining = file_size - bytes_transferred
-            this_chunk_size = min(CHUNK_SIZE, remaining)
+            this_chunk_size = min(chunk_size, remaining)
 
             # Read and broadcast chunk
             if rank == 0:
                 data = src_file.read(this_chunk_size)
                 # Pad to chunk size for consistent all_sum
-                if len(data) < CHUNK_SIZE:
-                    data = data + b'\x00' * (CHUNK_SIZE - len(data))
+                if len(data) < chunk_size:
+                    data = data + b'\x00' * (chunk_size - len(data))
                 chunk = mx.array(np.frombuffer(data, dtype=np.uint8))
             else:
-                chunk = mx.zeros((CHUNK_SIZE,), dtype=mx.uint8)
+                chunk = mx.zeros((chunk_size,), dtype=mx.uint8)
 
             # Transfer via all_sum
             result = mx.distributed.all_sum(chunk, group=group)
@@ -352,6 +426,14 @@ def sync_model_to_workers(
 
     logger.info(f"[Rank {rank}] Starting model sync (mode={mode})")
 
+    # Detect backend and select optimal chunk size
+    backend = detect_backend()
+    chunk_size = get_chunk_size(backend)
+    logger.info(
+        f"[Rank {rank}] Using backend={backend}, "
+        f"chunk_size={chunk_size / 1024 / 1024:.0f}MB"
+    )
+
     # Rank 0: resolve model path (may download from HF)
     if rank == 0:
         # Try to resolve the model path
@@ -423,7 +505,7 @@ def sync_model_to_workers(
                 # For now, always transfer - could optimize later
                 pass
 
-        transfer_file(file_src, file_dst, file_size, group)
+        transfer_file(file_src, file_dst, file_size, group, chunk_size)
 
     logger.info(
         f"[Rank {rank}] Model sync complete: "
