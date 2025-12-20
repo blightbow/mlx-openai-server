@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import shutil
+import socket
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +39,25 @@ MAX_FILENAME_LENGTH = 256
 
 # Maximum files in manifest (should be plenty for any model)
 MAX_MANIFEST_FILES = 100
+
+
+def get_node_prefix(rank: int) -> str:
+    """Get node/rank prefix for log messages.
+
+    When running under mlx.launch, includes hostname for easier identification.
+
+    Args:
+        rank: Rank number
+
+    Returns:
+        Log prefix like "[misha/0]" or "[Rank 0]"
+    """
+    # Check if running under mlx.launch (MLX_RANK env var is set)
+    if os.getenv("MLX_RANK") is not None:
+        hostname = socket.gethostname().split(".")[0]  # Short hostname
+        return f"[{hostname}/{rank}]"
+    else:
+        return f"[Rank {rank}]"
 
 
 def detect_backend() -> str:
@@ -224,7 +244,7 @@ def broadcast_manifest(
     if file_count == 0:
         return []
 
-    logger.debug(f"[Rank {rank}] Manifest has {file_count} files")
+    logger.debug(f"{get_node_prefix(rank)} Manifest has {file_count} files")
 
     # Broadcast each file entry: name (as bytes) + size
     # Pack as: [name_length, size, name_bytes...]
@@ -291,7 +311,7 @@ def transfer_file(
     num_chunks = (file_size + chunk_size - 1) // chunk_size
 
     logger.debug(
-        f"[Rank {rank}] Transferring {dst_path.name}: "
+        f"{get_node_prefix(rank)} Transferring {dst_path.name}: "
         f"{file_size / 1e6:.1f}MB in {num_chunks} chunks "
         f"({chunk_size / 1e6:.0f}MB each)"
     )
@@ -336,7 +356,7 @@ def transfer_file(
 
             if (chunk_idx + 1) % 10 == 0 or chunk_idx == num_chunks - 1:
                 pct = bytes_transferred / file_size * 100
-                logger.debug(f"[Rank {rank}] {dst_path.name}: {pct:.0f}%")
+                logger.debug(f"{get_node_prefix(rank)} {dst_path.name}: {pct:.0f}%")
 
     finally:
         if rank == 0:
@@ -417,20 +437,20 @@ def sync_model_to_workers(
         # Assume files are pre-staged at expected path
         if rank != 0 and not dst_path.exists():
             raise FileNotFoundError(
-                f"[Rank {rank}] Model not found at {dst_path} "
+                f"{get_node_prefix(rank)} Model not found at {dst_path} "
                 f"and --file-sync=none was specified. "
                 f"Use --file-sync=full to sync via distributed backend, or "
                 f"--worker-model-path to specify alternate location."
             )
         return dst_path
 
-    logger.info(f"[Rank {rank}] Starting model sync (mode={mode})")
+    logger.info(f"{get_node_prefix(rank)} Starting model sync (mode={mode})")
 
     # Detect backend and select optimal chunk size
     backend = detect_backend()
     chunk_size = get_chunk_size(backend)
     logger.info(
-        f"[Rank {rank}] Using backend={backend}, "
+        f"{get_node_prefix(rank)} Using backend={backend}, "
         f"chunk_size={chunk_size / 1024 / 1024:.0f}MB"
     )
 
@@ -470,12 +490,12 @@ def sync_model_to_workers(
         has_space, free_bytes = check_disk_space(dst_path, total_size)
         if not has_space:
             raise DiskSpaceError(
-                f"[Rank {rank}] Insufficient disk space: "
+                f"{get_node_prefix(rank)} Insufficient disk space: "
                 f"need {total_size / 1e9:.1f}GB, "
                 f"only {free_bytes / 1e9:.1f}GB available at {dst_path.parent}"
             )
         logger.info(
-            f"[Rank {rank}] Disk check OK: "
+            f"{get_node_prefix(rank)} Disk check OK: "
             f"{free_bytes / 1e9:.1f}GB free, need {total_size / 1e9:.1f}GB"
         )
 
@@ -499,7 +519,7 @@ def sync_model_to_workers(
         # Skip if file already exists with correct size
         if rank != 0 and file_dst.exists():
             if file_dst.stat().st_size == file_size:
-                logger.debug(f"[Rank {rank}] Skipping {filename} (already exists)")
+                logger.debug(f"{get_node_prefix(rank)} Skipping {filename} (already exists)")
                 # Still need to participate in all_sum for rank 0's transfer
                 # Actually, we need to skip on all ranks or none
                 # For now, always transfer - could optimize later
@@ -508,7 +528,7 @@ def sync_model_to_workers(
         transfer_file(file_src, file_dst, file_size, group, chunk_size)
 
     logger.info(
-        f"[Rank {rank}] Model sync complete: "
+        f"{get_node_prefix(rank)} Model sync complete: "
         f"{len(files_to_transfer)} files, {total_size / 1e9:.2f}GB"
     )
 
