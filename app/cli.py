@@ -191,6 +191,18 @@ def cli():
     default=None,
     help="Enable distributed inference. 'tensor' shards weights within layers (best for TB5 RDMA). 'pipeline' shards between layers. Requires mlx.launch wrapper.",
 )
+@click.option(
+    "--file-sync",
+    type=click.Choice(["none", "full", "sharded", "auto"]),
+    default="none",
+    help="Model file sync mode for distributed inference. 'none' (default) assumes paths aligned across ranks. 'full' syncs all files via distributed backend. 'sharded' syncs only needed files. 'auto' uses sharded for pipeline, full for tensor.",
+)
+@click.option(
+    "--worker-model-path",
+    default=None,
+    type=str,
+    help="Override model path for worker ranks. Use 'hf-cache' to store in HuggingFace cache structure. Default: same as --model-path.",
+)
 def launch(
     model_path,
     model_type,
@@ -214,6 +226,8 @@ def launch(
     trust_remote_code,
     chat_template_file,
     distributed,
+    file_sync,
+    worker_model_path,
 ) -> None:
     """Start the FastAPI/Uvicorn server with the supplied flags.
 
@@ -245,6 +259,8 @@ def launch(
         trust_remote_code=trust_remote_code,
         chat_template_file=chat_template_file,
         distributed=distributed,
+        file_sync=file_sync,
+        worker_model_path=worker_model_path,
     )
 
     asyncio.run(start(args))

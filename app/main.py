@@ -99,13 +99,36 @@ async def start(config: MLXServerConfig) -> None:
         if config.distributed:
             import mlx.core as mx
 
-            from .distributed import run_worker_loop
+            from .distributed import run_worker_loop, sync_model_to_workers
             from .models.mlx_lm import MLX_LM
 
-            # Check rank before loading model to avoid loading on coordinator
-            # (coordinator will load via setup_server -> handler)
+            # Initialize distributed group first
             group = mx.distributed.init()
             rank = group.rank()
+
+            # Sync model files before loading (all ranks participate)
+            # Resolve sync mode: auto uses sharded for pipeline, full for tensor
+            sync_mode = config.file_sync
+            if sync_mode == "auto":
+                sync_mode = "sharded" if config.distributed == "pipeline" else "full"
+
+            logger.info(
+                f"[Rank {rank}] Model sync check (mode={sync_mode})"
+            )
+            try:
+                model_path = sync_model_to_workers(
+                    config.model_path,
+                    group,
+                    mode=sync_mode,
+                    worker_model_path=config.worker_model_path,
+                )
+                # Update config with resolved local path for workers
+                if rank != 0:
+                    config.model_path = str(model_path)
+                logger.info(f"[Rank {rank}] Model path: {model_path}")
+            except Exception as e:
+                logger.error(f"[Rank {rank}] Model sync failed: {e}")
+                raise
 
             if rank != 0:
                 # Configure logging for worker (setup_server not called for workers)
