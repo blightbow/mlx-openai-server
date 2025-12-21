@@ -55,11 +55,17 @@ def configure_logging(
     log_level:
         Minimum log level to emit (e.g. "DEBUG", "INFO").
     """
+    import sys
+
     logger.remove()  # Remove default handler
 
-    # Add console handler
+    # Add console handler - use stderr with flush for distributed visibility
+    def _stderr_sink(msg):
+        sys.stderr.write(str(msg))
+        sys.stderr.flush()
+
     logger.add(
-        lambda msg: print(msg),
+        _stderr_sink,
         level=log_level,
         format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
         "<level>{level: <8}</level> | "

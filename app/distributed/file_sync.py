@@ -23,7 +23,7 @@ import os
 import shutil
 import socket
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Union
 
 import mlx.core as mx
 import numpy as np
@@ -776,7 +776,7 @@ def broadcast_file_bytes(
     file_path: str,
     group: mx.distributed.Group,
     chunk_size: Optional[int] = None,
-) -> bytes:
+) -> Union[bytes, bytearray]:
     """Broadcast file bytes from rank 0 to all ranks via all_sum.
 
     Args:
@@ -785,7 +785,7 @@ def broadcast_file_bytes(
         chunk_size: Override chunk size (auto-detected if None)
 
     Returns:
-        File bytes on all ranks
+        File bytes on all ranks (bytearray for memory efficiency)
     """
     rank = group.rank()
 
@@ -805,6 +805,7 @@ def broadcast_file_bytes(
     size_result = mx.distributed.all_sum(size_array, group=group)
     mx.eval(size_result)
     file_size = int(size_result[0].item())
+    del size_array, size_result
 
     if file_size == 0:
         return b""
@@ -832,16 +833,26 @@ def broadcast_file_bytes(
         result = mx.distributed.all_sum(chunk, group=group)
         mx.eval(result)
 
-        # Extract actual data (not padding)
-        chunk_bytes = bytes(result[:this_chunk_size].tolist())
-        result_bytes.extend(chunk_bytes)
+        # Extract actual data (not padding) - use numpy for efficient conversion
+        result_bytes.extend(np.array(result[:this_chunk_size], copy=False).tobytes())
         bytes_transferred += this_chunk_size
 
-    return bytes(result_bytes)
+        # Free MLX arrays immediately
+        del chunk, result
+
+    # Release MLX memory cache and source bytes
+    mx.clear_cache()
+    if file_bytes is not None:
+        del file_bytes
+
+    # Return bytearray directly - safetensors can handle it, avoids copy
+    return result_bytes
 
 
 def make_distributed_weight_loader(
     group: mx.distributed.Group,
+    model_path: str = None,
+    distributed_mode: str = None,
 ) -> Callable[[str], Dict[str, Any]]:
     """Create a weight loader that streams weights via distributed broadcast.
 
@@ -852,44 +863,142 @@ def make_distributed_weight_loader(
     The weights are parsed from safetensors format in memory, avoiding the
     need for disk storage on worker ranks.
 
+    For pipeline parallelism, files not needed by this rank are discarded
+    immediately after the collective broadcast (before parsing) to avoid
+    accumulating unnecessary weights in memory.
+
     Args:
         group: MLX distributed group
+        model_path: Path to model directory (for computing needed files)
+        distributed_mode: "pipeline" or "tensor" parallelism mode
 
     Returns:
         A callable that accepts a file path and returns a weight dictionary
 
     Example:
         >>> group = mx.distributed.init()
-        >>> loader = make_distributed_weight_loader(group)
+        >>> loader = make_distributed_weight_loader(group, model_path, "pipeline")
         >>> model, tokenizer = load(model_path, weight_loader=loader)
     """
     rank = group.rank()
+    world_size = group.size()
     backend = detect_backend()
     chunk_size = get_chunk_size(backend)
+
+    # For pipeline parallelism, compute which files each rank needs
+    # Rank 0 computes for ALL ranks and broadcasts (workers don't have model files)
+    needed_files = None
+    if distributed_mode == "pipeline" and model_path:
+        if rank == 0:
+            src_path = Path(model_path)
+            if not src_path.exists():
+                from huggingface_hub import snapshot_download
+                src_path = Path(snapshot_download(model_path, local_files_only=True))
+
+            index_path = src_path / "model.safetensors.index.json"
+            config_path = src_path / "config.json"
+
+            # Compute needed files for ALL ranks
+            all_rank_files = {}
+            if index_path.exists() and config_path.exists():
+                for r in range(world_size):
+                    files = compute_pipeline_files(index_path, config_path, r, world_size)
+                    all_rank_files[r] = list(files) if files else None
+
+            # Serialize and broadcast
+            manifest_json = json.dumps(all_rank_files).encode("utf-8")
+            manifest_size = len(manifest_json)
+            size_array = mx.array([manifest_size], dtype=mx.int64)
+        else:
+            size_array = mx.zeros((1,), dtype=mx.int64)
+
+        # Broadcast manifest size
+        size_result = mx.distributed.all_sum(size_array, group=group)
+        mx.eval(size_result)
+        manifest_size = int(size_result[0].item())
+        del size_array, size_result
+
+        if manifest_size > 0:
+            # Broadcast manifest data
+            if rank == 0:
+                manifest_array = mx.array(np.frombuffer(manifest_json, dtype=np.uint8))
+                # Pad to consistent size for all_sum
+                padded = mx.zeros((manifest_size,), dtype=mx.uint8)
+                padded = manifest_array
+            else:
+                padded = mx.zeros((manifest_size,), dtype=mx.uint8)
+
+            result = mx.distributed.all_sum(padded, group=group)
+            mx.eval(result)
+
+            # Deserialize
+            manifest_bytes = bytes(np.array(result, copy=False).tobytes())
+            all_rank_files = json.loads(manifest_bytes.decode("utf-8"))
+            del padded, result
+
+            # Extract this rank's needed files
+            rank_key = str(rank)  # JSON keys are strings
+            logger.info(
+                f"{get_node_prefix(rank)} Manifest received: "
+                f"keys={list(all_rank_files.keys())}"
+            )
+            if rank_key in all_rank_files and all_rank_files[rank_key]:
+                needed_files = set(all_rank_files[rank_key])
+                logger.info(
+                    f"{get_node_prefix(rank)} Pipeline mode: need {len(needed_files)} "
+                    f"of total weight files"
+                )
+            else:
+                logger.warning(
+                    f"{get_node_prefix(rank)} No files found in manifest for this rank! "
+                    f"rank_key={rank_key}, has_key={rank_key in all_rank_files}"
+                )
 
     logger.info(
         f"{get_node_prefix(rank)} Created distributed weight loader "
         f"(backend={backend}, chunk_size={chunk_size // 1024 // 1024}MB)"
     )
 
+    # Debug log file for weight loading (bypasses all output redirection)
+    _debug_log = open(f"/tmp/weight_loader_rank{rank}.log", "w")
+
     def distributed_loader(file_path: str) -> Dict[str, Any]:
         """Load weights via distributed broadcast."""
         file_name = Path(file_path).name
-        logger.debug(f"{get_node_prefix(rank)} Loading {file_name} via broadcast")
+        _debug_log.write(f">>> {file_name}, needed={len(needed_files) if needed_files else 'None'}\n")
+        _debug_log.flush()
 
-        # Broadcast file bytes from rank 0
+        # Broadcast file bytes from rank 0 (ALL ranks must participate)
         file_bytes = broadcast_file_bytes(file_path, group, chunk_size)
+        file_size_mb = len(file_bytes) / 1e6
+
+        # For pipeline mode, discard files this rank doesn't need BEFORE parsing
+        if needed_files is not None:
+            if file_name not in needed_files:
+                _debug_log.write(f"DISCARD: {file_name} ({file_size_mb:.1f}MB)\n")
+                _debug_log.flush()
+                del file_bytes
+                mx.clear_cache()
+                return {}
+            else:
+                _debug_log.write(f"KEEP: {file_name} ({file_size_mb:.1f}MB)\n")
+                _debug_log.flush()
+        else:
+            _debug_log.write(f"WARNING: needed_files is None! Keeping {file_name}\n")
+            _debug_log.flush()
 
         # Parse safetensors from bytes
-        # safetensors.numpy.load() returns dict of numpy arrays
         numpy_weights = safetensors.numpy.load(file_bytes)
+
+        # Free raw bytes immediately - no longer needed after parsing
+        del file_bytes
 
         # Convert numpy arrays to mx.array
         weights = {k: mx.array(v) for k, v in numpy_weights.items()}
+        del numpy_weights
 
         logger.debug(
-            f"{get_node_prefix(rank)} Loaded {file_name}: "
-            f"{len(weights)} tensors, {len(file_bytes) / 1e6:.1f}MB"
+            f"{get_node_prefix(rank)} Loaded {file_name}: {len(weights)} tensors"
         )
 
         return weights

@@ -1,4 +1,5 @@
 import gc
+import inspect
 import os
 from typing import Any, Callable, Dict, Generator, List, Optional, Union
 
@@ -9,6 +10,14 @@ from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load, sharded_load
 from outlines.processors import JSONLogitsProcessor
+
+# Verify mlx-lm has weight_loader support
+_sharded_load_sig = inspect.signature(sharded_load)
+if "weight_loader" not in _sharded_load_sig.parameters:
+    raise ImportError(
+        "Installed mlx-lm does not support the weight_loader parameter. "
+        "Please install a supported version of mlx-lm that includes this feature."
+    )
 
 from ..utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
 

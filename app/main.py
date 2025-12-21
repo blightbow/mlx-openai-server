@@ -116,6 +116,17 @@ async def start(config: MLXServerConfig) -> None:
             if sync_mode == "auto":
                 sync_mode = "sharded" if config.distributed == "pipeline" else "full"
 
+            # Configure logging early for workers so all distributed logs are captured
+            # (rank 0 configures via setup_server later)
+            if rank != 0:
+                from .server import configure_logging
+
+                configure_logging(
+                    log_file=config.log_file,
+                    no_log_file=config.no_log_file,
+                    log_level=config.log_level,
+                )
+
             # For memory mode, create distributed weight loader (no disk sync needed)
             # For disk modes (none/full/sharded), sync files first
             weight_loader = None
@@ -123,7 +134,11 @@ async def start(config: MLXServerConfig) -> None:
                 logger.info(f"[Rank {rank}] Using memory-based weight streaming")
                 # Validate memory before starting (fail early if insufficient)
                 validate_memory_for_streaming(config.model_path, group)
-                weight_loader = make_distributed_weight_loader(group)
+                weight_loader = make_distributed_weight_loader(
+                    group,
+                    model_path=config.model_path,
+                    distributed_mode=config.distributed,
+                )
                 # Store on config so setup_server can pass it to handlers
                 # ALL ranks must use the same weight_loader for collective ops
                 config.weight_loader = weight_loader
@@ -145,15 +160,6 @@ async def start(config: MLXServerConfig) -> None:
                     raise
 
             if rank != 0:
-                # Configure logging for worker (setup_server not called for workers)
-                from .server import configure_logging
-
-                configure_logging(
-                    log_file=config.log_file,
-                    no_log_file=config.no_log_file,
-                    log_level=config.log_level,
-                )
-
                 # Workers load model and run inference loop
                 logger.info(f"[Rank {rank}] Worker mode - loading model shard")
                 mlx_lm = MLX_LM(
