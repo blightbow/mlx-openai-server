@@ -73,17 +73,17 @@ def detect_backend() -> str:
     if backend in ("jaccl", "ring", "mpi", "nccl"):
         return backend
 
+    # Check for JACCL-specific environment variable
+    # mlx.launch sets MLX_JACCL_COORDINATOR for jaccl backend
+    if os.getenv("MLX_JACCL_COORDINATOR"):
+        return "jaccl"
+
     # Check for MPI environment variables
     if any(key.startswith(("OMPI_", "PMI_", "MPI_")) for key in os.environ):
         return "mpi"
 
-    # Check for JACCL-specific indicators
-    # JACCL uses MLX_HOSTFILE and typically has high connection counts
+    # Check for ring backend (uses MLX_HOSTFILE without JACCL coordinator)
     if os.getenv("MLX_HOSTFILE"):
-        # If connections_per_ip is high (>1), likely JACCL
-        # Ring backend typically uses 1 connection
-        # For now, we can't reliably distinguish without more info
-        # Default to ring if hostfile is present
         return "ring"
 
     # Unable to detect
@@ -374,6 +374,85 @@ def transfer_file(
             )
 
 
+def get_metadata_files(manifest: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """Extract metadata files from manifest (small files needed by all ranks)."""
+    metadata_patterns = (
+        ".json",      # config.json, tokenizer.json, etc.
+        ".txt",       # vocab files
+        ".model",     # sentencepiece models
+        ".jinja",     # chat templates
+        ".py",        # custom code
+    )
+    return [(name, size) for name, size in manifest
+            if any(name.endswith(ext) for ext in metadata_patterns)]
+
+
+def get_weight_files(manifest: list[tuple[str, int]]) -> list[tuple[str, int]]:
+    """Extract weight files from manifest (large safetensor files)."""
+    return [(name, size) for name, size in manifest if name.endswith(".safetensors")]
+
+
+def compute_pipeline_files(
+    index_path: Path,
+    config_path: Path,
+    rank: int,
+    world_size: int,
+) -> set[str]:
+    """Compute which weight files a rank needs for pipeline parallelism.
+
+    Uses the same layer assignment logic as mlx_lm's pipeline() method.
+    """
+    # Read config to get layer count
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    num_layers = config.get("num_hidden_layers", 0)
+    if num_layers == 0:
+        # Can't determine layers, fall back to all files
+        return None
+
+    # Read weight index
+    if not index_path.exists():
+        # No index file, can't do sharded loading
+        return None
+
+    with open(index_path, "r") as f:
+        weight_index = json.load(f).get("weight_map", {})
+
+    if not weight_index:
+        return None
+
+    # Compute layer assignment (same as PipelineMixin)
+    # Layers are distributed evenly across ranks
+    layers_per_rank = num_layers // world_size
+    start_layer = rank * layers_per_rank
+    end_layer = start_layer + layers_per_rank if rank < world_size - 1 else num_layers
+
+    # Find files containing parameters for our layers
+    needed_files = set()
+    for param_name, file_name in weight_index.items():
+        # Check if this parameter belongs to our layers
+        # Format: model.layers.{N}.* or similar
+        if ".layers." in param_name:
+            try:
+                # Extract layer number
+                parts = param_name.split(".layers.")
+                if len(parts) >= 2:
+                    layer_num = int(parts[1].split(".")[0])
+                    if start_layer <= layer_num < end_layer:
+                        needed_files.add(file_name)
+            except (ValueError, IndexError):
+                # Can't parse layer number, include file to be safe
+                needed_files.add(file_name)
+        else:
+            # Non-layer parameter (embeddings, lm_head, etc.)
+            # These are typically needed by rank 0 and last rank
+            if rank == 0 or rank == world_size - 1:
+                needed_files.add(file_name)
+
+    return needed_files
+
+
 def resolve_worker_path(model_path: str, worker_model_path: Optional[str]) -> Path:
     """Resolve the model path for worker ranks.
 
@@ -481,31 +560,82 @@ def sync_model_to_workers(
 
     # Broadcast manifest to all ranks
     manifest = broadcast_manifest(files, group)
-    total_size = sum(size for _, size in manifest)
 
-    # dst_path already set above based on rank and worker_model_path
+    # Separate metadata and weight files
+    metadata_files = get_metadata_files(manifest)
+    weight_files = get_weight_files(manifest)
 
-    # Check disk space on workers before transfer
+    # Create destination directory for workers
     if rank != 0:
-        has_space, free_bytes = check_disk_space(dst_path, total_size)
+        dst_path.mkdir(parents=True, exist_ok=True)
+
+    # Phase 1: Transfer metadata files (small, needed by all ranks)
+    logger.info(
+        f"{get_node_prefix(rank)} Phase 1: Transferring {len(metadata_files)} metadata files"
+    )
+    for filename, file_size in metadata_files:
+        if rank == 0:
+            file_src = src_path / filename
+        else:
+            file_src = None
+        file_dst = dst_path / filename
+        transfer_file(file_src, file_dst, file_size, group, chunk_size)
+
+    # Phase 2: Determine which weight files this rank needs
+    if mode == "sharded":
+        # Try to compute needed files for pipeline parallelism
+        index_path = dst_path / "model.safetensors.index.json"
+        config_path = dst_path / "config.json"
+
+        needed_file_names = compute_pipeline_files(index_path, config_path, rank, size)
+
+        if needed_file_names is not None:
+            # Filter weight files to only those needed by this rank
+            weight_files_to_transfer = [
+                (name, fsize) for name, fsize in weight_files
+                if name in needed_file_names
+            ]
+            logger.info(
+                f"{get_node_prefix(rank)} Sharded mode: need {len(weight_files_to_transfer)} "
+                f"of {len(weight_files)} weight files"
+            )
+        else:
+            # Fallback to full transfer if we can't determine needed files
+            logger.warning(
+                f"{get_node_prefix(rank)} Cannot determine pipeline sharding, "
+                f"falling back to full transfer"
+            )
+            weight_files_to_transfer = weight_files
+    else:
+        # Full mode: transfer all weight files
+        weight_files_to_transfer = weight_files
+
+    # Calculate required disk space for this rank's files
+    metadata_size = sum(fsize for _, fsize in metadata_files)
+    weight_size = sum(fsize for _, fsize in weight_files_to_transfer)
+    required_size = metadata_size + weight_size
+
+    # Check disk space on workers before large transfers
+    if rank != 0:
+        has_space, free_bytes = check_disk_space(dst_path, required_size)
         if not has_space:
             raise DiskSpaceError(
                 f"{get_node_prefix(rank)} Insufficient disk space: "
-                f"need {total_size / 1e9:.1f}GB, "
+                f"need {required_size / 1e9:.1f}GB, "
                 f"only {free_bytes / 1e9:.1f}GB available at {dst_path.parent}"
             )
         logger.info(
             f"{get_node_prefix(rank)} Disk check OK: "
-            f"{free_bytes / 1e9:.1f}GB free, need {total_size / 1e9:.1f}GB"
+            f"{free_bytes / 1e9:.1f}GB free, need {required_size / 1e9:.1f}GB"
         )
 
-        # Create destination directory
-        dst_path.mkdir(parents=True, exist_ok=True)
+    # Phase 2: Transfer weight files
+    logger.info(
+        f"{get_node_prefix(rank)} Phase 2: Transferring {len(weight_files_to_transfer)} "
+        f"weight files ({weight_size / 1e9:.2f}GB)"
+    )
 
-    # Filter files for sharded mode
-    # TODO: Implement sharded filtering based on pipeline layer assignment
-    # For now, sharded mode transfers all files (same as full)
-    files_to_transfer = manifest
+    files_to_transfer = weight_files_to_transfer
 
     # Transfer each file
     for filename, file_size in files_to_transfer:
@@ -527,9 +657,11 @@ def sync_model_to_workers(
 
         transfer_file(file_src, file_dst, file_size, group, chunk_size)
 
+    total_transferred = metadata_size + weight_size
     logger.info(
         f"{get_node_prefix(rank)} Model sync complete: "
-        f"{len(files_to_transfer)} files, {total_size / 1e9:.2f}GB"
+        f"{len(metadata_files) + len(files_to_transfer)} files, "
+        f"{total_transferred / 1e9:.2f}GB"
     )
 
     # Return the appropriate path
