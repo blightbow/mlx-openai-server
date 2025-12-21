@@ -124,6 +124,9 @@ async def start(config: MLXServerConfig) -> None:
                 # Validate memory before starting (fail early if insufficient)
                 validate_memory_for_streaming(config.model_path, group)
                 weight_loader = make_distributed_weight_loader(group)
+                # Store on config so setup_server can pass it to handlers
+                # ALL ranks must use the same weight_loader for collective ops
+                config.weight_loader = weight_loader
             else:
                 logger.info(f"[Rank {rank}] Model sync check (mode={sync_mode})")
                 try:

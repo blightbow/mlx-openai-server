@@ -7,6 +7,7 @@ arguments and applying small model-type-specific defaults).
 """
 
 from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Optional
 
 from loguru import logger
 
@@ -43,8 +44,10 @@ class MLXServerConfig:
     trust_remote_code: bool = False
     chat_template_file: str | None = None
     distributed: str | None = None  # "tensor" or "pipeline", None for non-distributed
-    file_sync: str = "none"  # "none", "full", "sharded", or "auto"
+    file_sync: str = "none"  # "none", "full", "sharded", "memory", or "auto"
     worker_model_path: str | None = None  # Override model path for workers, or "hf-cache"
+    # Custom weight loader for distributed memory mode (all ranks must use same loader)
+    weight_loader: Optional[Callable[[str], Dict[str, Any]]] = None
 
     # Used to capture raw CLI input before processing
     lora_paths_str: str | None = None

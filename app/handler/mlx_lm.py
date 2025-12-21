@@ -9,7 +9,7 @@ from ..models.mlx_lm import MLX_LM
 from ..core.queue import RequestQueue
 from .parser import ParserFactory
 from ..utils.errors import create_error_response
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
 from ..schemas.openai import ChatCompletionRequest, EmbeddingRequest, UsageInfo
 
 
@@ -30,6 +30,7 @@ class MLXLMHandler:
         trust_remote_code: bool = False,
         chat_template_file: str = None,
         distributed: str = None,
+        weight_loader: Optional[Callable[[str], Dict[str, Any]]] = None,
     ):
         """
         Initialize the handler with the specified model path.
@@ -44,6 +45,7 @@ class MLXLMHandler:
             trust_remote_code (bool): Enable trust_remote_code when loading models.
             chat_template_file (str): Path to a custom chat template file.
             distributed (str): Distributed mode - "tensor" or "pipeline", None for non-distributed.
+            weight_loader (Callable): Custom weight loader for distributed memory streaming.
         """
         self.model_path = model_path
         self.model = MLX_LM(
@@ -52,6 +54,7 @@ class MLXLMHandler:
             trust_remote_code=trust_remote_code,
             chat_template_file=chat_template_file,
             distributed=distributed,
+            weight_loader=weight_loader,
         )
         self.model_created = int(time.time())  # Store creation time when model is loaded
         self.model_type = self.model.get_model_type()

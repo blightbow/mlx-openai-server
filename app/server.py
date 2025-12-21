@@ -205,6 +205,7 @@ def create_lifespan(config_args: MLXServerConfig):
                     trust_remote_code=config_args.trust_remote_code,
                     chat_template_file=config_args.chat_template_file,
                     distributed=config_args.distributed,
+                    weight_loader=config_args.weight_loader,
                 )
             # Initialize queue
             await handler.initialize(
