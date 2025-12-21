@@ -40,6 +40,9 @@ MAX_FILENAME_LENGTH = 256
 # Maximum files in manifest (should be plenty for any model)
 MAX_MANIFEST_FILES = 100
 
+# Disk space buffer percentage (large models use large disks)
+DISK_SPACE_BUFFER_PERCENT = 2
+
 
 def get_node_prefix(rank: int) -> str:
     """Get node/rank prefix for log messages.
@@ -180,8 +183,8 @@ def check_disk_space(cache_path: Path, required_bytes: int) -> tuple[bool, int]:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
 
     usage = shutil.disk_usage(cache_path.parent)
-    # Require 10% buffer for safety
-    has_space = usage.free >= required_bytes * 1.1
+    buffer_multiplier = 1 + DISK_SPACE_BUFFER_PERCENT * 0.01
+    has_space = usage.free >= required_bytes * buffer_multiplier
     return has_space, usage.free
 
 
@@ -626,9 +629,11 @@ def sync_model_to_workers(
     if rank != 0:
         has_space, free_bytes = check_disk_space(dst_path, required_size)
         if not has_space:
+            buffer_multiplier = 1 + DISK_SPACE_BUFFER_PERCENT * 0.01
+            buffered_size = required_size * buffer_multiplier
             raise DiskSpaceError(
                 f"{get_node_prefix(rank)} Insufficient disk space: "
-                f"need {required_size / 1e9:.1f}GB, "
+                f"need {buffered_size / 1e9:.1f}GB (inc. {DISK_SPACE_BUFFER_PERCENT}% buffer), "
                 f"only {free_bytes / 1e9:.1f}GB available at {dst_path.parent}"
             )
         logger.info(
