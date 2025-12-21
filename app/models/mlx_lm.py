@@ -1,6 +1,6 @@
 import gc
 import os
-from typing import Dict, Generator, List, Union
+from typing import Any, Callable, Dict, Generator, List, Optional, Union
 
 import mlx.core as mx
 from loguru import logger
@@ -38,6 +38,7 @@ class MLX_LM:
         trust_remote_code: bool = False,
         chat_template_file: str = None,
         distributed: str = None,
+        weight_loader: Optional[Callable[[str], Dict[str, Any]]] = None,
     ):
         try:
             self.distributed = distributed
@@ -54,7 +55,9 @@ class MLX_LM:
                     f"group size: {self.group.size()}"
                 )
 
-            self.model, self.tokenizer = self._initialize_model(model_path, trust_remote_code)
+            self.model, self.tokenizer = self._initialize_model(
+                model_path, trust_remote_code, weight_loader
+            )
             self.pad_token_id = self.tokenizer.pad_token_id
             self.bos_token = self.tokenizer.bos_token
             self.model_type = self.model.model_type
@@ -68,18 +71,23 @@ class MLX_LM:
         except Exception as e:
             raise ValueError(f"Error loading model: {str(e)}")
 
-    def _initialize_model(self, model_path: str, trust_remote_code: bool = False):
+    def _initialize_model(
+        self,
+        model_path: str,
+        trust_remote_code: bool = False,
+        weight_loader: Optional[Callable[[str], Dict[str, Any]]] = None,
+    ):
         if self.distributed:
-            # sharded_load(path, pipeline_group, tensor_group)
+            # sharded_load(path, pipeline_group, tensor_group, weight_loader)
             # - tensor: shard weights within layers -> pass (None, group)
             # - pipeline: shard weights between layers -> pass (group, None)
             try:
                 if self.distributed == "pipeline":
                     logger.info(f"[Rank {self.rank}] Using pipeline parallelism")
-                    return sharded_load(model_path, self.group, None)
+                    return sharded_load(model_path, self.group, None, weight_loader=weight_loader)
                 else:  # tensor (default)
                     logger.info(f"[Rank {self.rank}] Using tensor parallelism")
-                    return sharded_load(model_path, None, self.group)
+                    return sharded_load(model_path, None, self.group, weight_loader=weight_loader)
             except ValueError as e:
                 error_msg = str(e)
                 if "does not support pipelining" in error_msg:
@@ -101,7 +109,12 @@ class MLX_LM:
                     ) from e
                 else:
                     raise
-        return load(model_path, lazy=False, tokenizer_config={"trust_remote_code": trust_remote_code})
+        return load(
+            model_path,
+            lazy=False,
+            tokenizer_config={"trust_remote_code": trust_remote_code},
+            weight_loader=weight_loader,
+        )
         
     def _apply_pooling_strategy(self, embeddings: mx.array) -> mx.array:
         embeddings = mx.mean(embeddings, axis=1)

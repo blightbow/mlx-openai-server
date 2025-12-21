@@ -193,9 +193,9 @@ def cli():
 )
 @click.option(
     "--file-sync",
-    type=click.Choice(["none", "full", "sharded", "auto"]),
+    type=click.Choice(["none", "full", "sharded", "memory", "auto"]),
     default="none",
-    help="Model file sync mode for distributed inference. 'none' (default) assumes paths aligned across ranks. 'full' syncs all files via distributed backend. 'sharded' syncs only needed files. 'auto' uses sharded for pipeline, full for tensor.",
+    help="Model file sync mode for distributed inference. 'none' (default) assumes paths aligned across ranks. 'full' syncs all files to disk. 'sharded' syncs only needed files to disk. 'memory' streams weights directly to RAM (no worker disk needed). 'auto' uses sharded for pipeline, full for tensor.",
 )
 @click.option(
     "--worker-model-path",

@@ -23,10 +23,11 @@ import os
 import shutil
 import socket
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Dict, Optional
 
 import mlx.core as mx
 import numpy as np
+import safetensors.numpy
 from loguru import logger
 
 # Chunk size limits by backend
@@ -142,6 +143,11 @@ class DiskSpaceError(FileSyncError):
     pass
 
 
+class MemoryError(FileSyncError):
+    """Raised when system has insufficient memory for streaming."""
+    pass
+
+
 class TransferError(FileSyncError):
     """Raised when file transfer fails."""
     pass
@@ -186,6 +192,89 @@ def check_disk_space(cache_path: Path, required_bytes: int) -> tuple[bool, int]:
     buffer_multiplier = 1 + DISK_SPACE_BUFFER_PERCENT * 0.01
     has_space = usage.free >= required_bytes * buffer_multiplier
     return has_space, usage.free
+
+
+def get_available_memory() -> int:
+    """Get available system memory in bytes.
+
+    Returns:
+        Available memory in bytes
+    """
+    import subprocess
+    import platform
+
+    if platform.system() == "Darwin":
+        # macOS: use vm_stat to get free + inactive pages
+        try:
+            result = subprocess.run(
+                ["vm_stat"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            # Parse vm_stat output
+            page_size = 16384  # Default for Apple Silicon
+            free_pages = 0
+            inactive_pages = 0
+            for line in result.stdout.split("\n"):
+                if "page size of" in line:
+                    page_size = int(line.split()[-2])
+                elif "Pages free:" in line:
+                    free_pages = int(line.split()[-1].rstrip("."))
+                elif "Pages inactive:" in line:
+                    inactive_pages = int(line.split()[-1].rstrip("."))
+            # Available = free + inactive (can be reclaimed)
+            return (free_pages + inactive_pages) * page_size
+        except Exception:
+            pass
+
+    # Fallback: try psutil if available
+    try:
+        import psutil
+        return psutil.virtual_memory().available
+    except ImportError:
+        pass
+
+    # Last resort: return 0 (will skip check)
+    return 0
+
+
+def check_memory_for_streaming(
+    model_bytes: int,
+    max_file_bytes: int,
+    rank: int,
+) -> tuple[bool, int, int]:
+    """Check if system has enough memory for streaming weight loading.
+
+    For memory-based loading, we need:
+    - Space for the model weights
+    - Plus one file buffer (held during transfer, freed after parsing)
+
+    Args:
+        model_bytes: Total bytes of model weights to load
+        max_file_bytes: Size of the largest single file (buffer requirement)
+        rank: Current rank (for logging)
+
+    Returns:
+        Tuple of (has_enough_memory, available_bytes, required_bytes)
+    """
+    available = get_available_memory()
+
+    if available == 0:
+        # Couldn't determine memory, skip check
+        logger.warning(
+            f"{get_node_prefix(rank)} Could not determine available memory, skipping check"
+        )
+        return True, 0, 0
+
+    # Required: model weights + one file buffer + small margin
+    required = model_bytes + max_file_bytes
+    buffer_multiplier = 1 + DISK_SPACE_BUFFER_PERCENT * 0.01
+    required_with_buffer = int(required * buffer_multiplier)
+
+    has_memory = available >= required_with_buffer
+
+    return has_memory, available, required_with_buffer
 
 
 def get_model_files(model_path: Path) -> list[tuple[str, int]]:
@@ -681,3 +770,194 @@ def sync_model_to_workers(
         return src_path
     else:
         return dst_path
+
+
+def broadcast_file_bytes(
+    file_path: str,
+    group: mx.distributed.Group,
+    chunk_size: Optional[int] = None,
+) -> bytes:
+    """Broadcast file bytes from rank 0 to all ranks via all_sum.
+
+    Args:
+        file_path: Path to file (only read on rank 0)
+        group: MLX distributed group
+        chunk_size: Override chunk size (auto-detected if None)
+
+    Returns:
+        File bytes on all ranks
+    """
+    rank = group.rank()
+
+    if chunk_size is None:
+        chunk_size = get_chunk_size()
+
+    # Rank 0 reads file and broadcasts size
+    if rank == 0:
+        file_bytes = Path(file_path).read_bytes()
+        file_size = len(file_bytes)
+        size_array = mx.array([file_size], dtype=mx.int64)
+    else:
+        file_bytes = None
+        size_array = mx.zeros((1,), dtype=mx.int64)
+
+    # Broadcast file size
+    size_result = mx.distributed.all_sum(size_array, group=group)
+    mx.eval(size_result)
+    file_size = int(size_result[0].item())
+
+    if file_size == 0:
+        return b""
+
+    # Calculate chunks
+    num_chunks = (file_size + chunk_size - 1) // chunk_size
+
+    # Collect all chunks
+    result_bytes = bytearray()
+    bytes_transferred = 0
+
+    for chunk_idx in range(num_chunks):
+        remaining = file_size - bytes_transferred
+        this_chunk_size = min(chunk_size, remaining)
+
+        if rank == 0:
+            chunk_data = file_bytes[bytes_transferred:bytes_transferred + this_chunk_size]
+            # Pad to chunk size for consistent all_sum
+            if len(chunk_data) < chunk_size:
+                chunk_data = chunk_data + b'\x00' * (chunk_size - len(chunk_data))
+            chunk = mx.array(np.frombuffer(chunk_data, dtype=np.uint8))
+        else:
+            chunk = mx.zeros((chunk_size,), dtype=mx.uint8)
+
+        result = mx.distributed.all_sum(chunk, group=group)
+        mx.eval(result)
+
+        # Extract actual data (not padding)
+        chunk_bytes = bytes(result[:this_chunk_size].tolist())
+        result_bytes.extend(chunk_bytes)
+        bytes_transferred += this_chunk_size
+
+    return bytes(result_bytes)
+
+
+def make_distributed_weight_loader(
+    group: mx.distributed.Group,
+) -> Callable[[str], Dict[str, Any]]:
+    """Create a weight loader that streams weights via distributed broadcast.
+
+    This loader is designed to be passed to mlx_lm's load() function via the
+    weight_loader parameter. Instead of each rank reading from disk, rank 0
+    reads the file and broadcasts bytes to all other ranks via all_sum().
+
+    The weights are parsed from safetensors format in memory, avoiding the
+    need for disk storage on worker ranks.
+
+    Args:
+        group: MLX distributed group
+
+    Returns:
+        A callable that accepts a file path and returns a weight dictionary
+
+    Example:
+        >>> group = mx.distributed.init()
+        >>> loader = make_distributed_weight_loader(group)
+        >>> model, tokenizer = load(model_path, weight_loader=loader)
+    """
+    rank = group.rank()
+    backend = detect_backend()
+    chunk_size = get_chunk_size(backend)
+
+    logger.info(
+        f"{get_node_prefix(rank)} Created distributed weight loader "
+        f"(backend={backend}, chunk_size={chunk_size // 1024 // 1024}MB)"
+    )
+
+    def distributed_loader(file_path: str) -> Dict[str, Any]:
+        """Load weights via distributed broadcast."""
+        file_name = Path(file_path).name
+        logger.debug(f"{get_node_prefix(rank)} Loading {file_name} via broadcast")
+
+        # Broadcast file bytes from rank 0
+        file_bytes = broadcast_file_bytes(file_path, group, chunk_size)
+
+        # Parse safetensors from bytes
+        # safetensors.numpy.load() returns dict of numpy arrays
+        numpy_weights = safetensors.numpy.load(file_bytes)
+
+        # Convert numpy arrays to mx.array
+        weights = {k: mx.array(v) for k, v in numpy_weights.items()}
+
+        logger.debug(
+            f"{get_node_prefix(rank)} Loaded {file_name}: "
+            f"{len(weights)} tensors, {len(file_bytes) / 1e6:.1f}MB"
+        )
+
+        return weights
+
+    return distributed_loader
+
+
+def validate_memory_for_streaming(
+    model_path: str,
+    group: mx.distributed.Group,
+) -> None:
+    """Validate all ranks have enough memory for streaming weight loading.
+
+    This should be called before creating the distributed weight loader
+    to fail early if any rank lacks sufficient memory.
+
+    Args:
+        model_path: Path to model directory (rank 0 only)
+        group: MLX distributed group
+
+    Raises:
+        MemoryError: If any rank has insufficient memory
+    """
+    rank = group.rank()
+
+    # Rank 0 reads manifest and broadcasts sizes
+    if rank == 0:
+        src_path = Path(model_path)
+        if not src_path.exists():
+            # Try HuggingFace cache
+            from huggingface_hub import snapshot_download
+            src_path = Path(snapshot_download(model_path, local_files_only=True))
+
+        files = get_model_files(src_path)
+        weight_files = get_weight_files(files)
+        total_size = sum(size for _, size in weight_files)
+        max_file_size = max(size for _, size in weight_files) if weight_files else 0
+
+        # Broadcast total size and max file size
+        sizes = mx.array([total_size, max_file_size], dtype=mx.int64)
+        logger.info(
+            f"{get_node_prefix(rank)} Model: {len(weight_files)} weight files, "
+            f"total {total_size / 1e9:.1f}GB, max file {max_file_size / 1e9:.1f}GB"
+        )
+    else:
+        sizes = mx.zeros((2,), dtype=mx.int64)
+
+    # Broadcast sizes to all ranks
+    sizes_result = mx.distributed.all_sum(sizes, group=group)
+    mx.eval(sizes_result)
+    total_size = int(sizes_result[0].item())
+    max_file_size = int(sizes_result[1].item())
+
+    # Each rank checks their memory
+    has_memory, available, required = check_memory_for_streaming(
+        total_size, max_file_size, rank
+    )
+
+    if not has_memory:
+        raise MemoryError(
+            f"{get_node_prefix(rank)} Insufficient memory for streaming: "
+            f"need {required / 1e9:.1f}GB (model + buffer), "
+            f"only {available / 1e9:.1f}GB available. "
+            f"Use --file-sync=full or --file-sync=sharded to use disk instead."
+        )
+
+    if available > 0:
+        logger.info(
+            f"{get_node_prefix(rank)} Memory check OK: "
+            f"{available / 1e9:.1f}GB available, need {required / 1e9:.1f}GB"
+        )

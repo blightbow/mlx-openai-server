@@ -19,8 +19,11 @@ from .file_sync import (
     sync_model_to_workers,
     check_disk_space,
     get_cache_path,
+    make_distributed_weight_loader,
+    validate_memory_for_streaming,
     FileSyncError,
     DiskSpaceError,
+    MemoryError,
     TransferError,
 )
 
@@ -34,7 +37,10 @@ __all__ = [
     "sync_model_to_workers",
     "check_disk_space",
     "get_cache_path",
+    "make_distributed_weight_loader",
+    "validate_memory_for_streaming",
     "FileSyncError",
     "DiskSpaceError",
+    "MemoryError",
     "TransferError",
 ]
