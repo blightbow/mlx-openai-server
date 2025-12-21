@@ -244,6 +244,56 @@ class TestPipelineFileComputation:
         )
         assert result is None
 
+    def test_embed_lm_head_separation(self):
+        """Embeddings go to rank 0, lm_head goes to last rank only."""
+        from app.distributed.file_sync import compute_pipeline_files
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+
+            # 4 layers, separate files for embed and lm_head
+            config = {"num_hidden_layers": 4}
+            with open(tmppath / "config.json", "w") as f:
+                json.dump(config, f)
+
+            weight_map = {
+                # Embeddings in dedicated file
+                "model.embed_tokens.weight": "embed.safetensors",
+                # Layers 0-1
+                "model.layers.0.weight": "layers-0-1.safetensors",
+                "model.layers.1.weight": "layers-0-1.safetensors",
+                # Layers 2-3
+                "model.layers.2.weight": "layers-2-3.safetensors",
+                "model.layers.3.weight": "layers-2-3.safetensors",
+                # LM head and final norm in dedicated file
+                "lm_head.weight": "lm_head.safetensors",
+                "model.norm.weight": "lm_head.safetensors",
+            }
+            with open(tmppath / "model.safetensors.index.json", "w") as f:
+                json.dump({"weight_map": weight_map}, f)
+
+            # Rank 0: layers 0-1 + embeddings (NOT lm_head)
+            rank0_files = compute_pipeline_files(
+                tmppath / "model.safetensors.index.json",
+                tmppath / "config.json",
+                rank=0,
+                world_size=2,
+            )
+            assert "embed.safetensors" in rank0_files
+            assert "layers-0-1.safetensors" in rank0_files
+            assert "lm_head.safetensors" not in rank0_files
+
+            # Rank 1: layers 2-3 + lm_head (NOT embeddings)
+            rank1_files = compute_pipeline_files(
+                tmppath / "model.safetensors.index.json",
+                tmppath / "config.json",
+                rank=1,
+                world_size=2,
+            )
+            assert "layers-2-3.safetensors" in rank1_files
+            assert "lm_head.safetensors" in rank1_files
+            assert "embed.safetensors" not in rank1_files
+
 
 class TestNodePrefix:
     """Tests for log message node prefix."""

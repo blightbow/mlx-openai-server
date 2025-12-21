@@ -445,10 +445,17 @@ def compute_pipeline_files(
                 # Can't parse layer number, include file to be safe
                 needed_files.add(file_name)
         else:
-            # Non-layer parameter (embeddings, lm_head, etc.)
-            # These are typically needed by rank 0 and last rank
-            if rank == 0 or rank == world_size - 1:
-                needed_files.add(file_name)
+            # Non-layer parameters - assign based on pipeline position
+            # Embeddings are needed by first rank (processes input)
+            # lm_head/final_norm are needed by last rank (produces output)
+            param_lower = param_name.lower()
+            if "embed" in param_lower:
+                if rank == 0:
+                    needed_files.add(file_name)
+            else:
+                # lm_head, model.norm, etc. → last rank
+                if rank == world_size - 1:
+                    needed_files.add(file_name)
 
     return needed_files
 
