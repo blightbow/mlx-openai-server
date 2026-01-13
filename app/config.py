@@ -48,6 +48,15 @@ class MLXServerConfig:
     worker_model_path: str | None = None  # Override model path for workers, or "hf-cache"
     # Custom weight loader for distributed memory mode (all ranks must use same loader)
     weight_loader: Optional[Callable[[str], Dict[str, Any]]] = None
+    # Distributed backend: "ring", "mpi", "nccl", "jaccl" (same as mlx.launch)
+    backend: str | None = None  # Auto-detected if not specified
+    # Out-of-band coordination (PyTorch TCPStore) for JACCL rendezvous only
+    oob_host: str | None = None  # Coordinator IP for JACCL OOB; None disables OOB
+    oob_port: int = 29400  # TCP port for JACCL OOB rendezvous
+    # Direct execution without mlx.launch (hostfile provides JACCL env setup)
+    hostfile: str | None = None  # Path to mlx.launch format hostfile (JSON)
+    rank: int | None = None  # Explicit rank (overrides MLX_RANK env var)
+    jaccl_port: int = 32323  # JACCL coordinator port
 
     # Used to capture raw CLI input before processing
     lora_paths_str: str | None = None

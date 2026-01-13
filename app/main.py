@@ -22,6 +22,7 @@ Distributed inference (via mlx.launch):
         python -m app.main launch --model-path <model> --distributed=tensor
 """
 
+import os
 import sys
 
 import uvicorn
@@ -102,14 +103,83 @@ async def start(config: MLXServerConfig) -> None:
             from .distributed import (
                 run_worker_loop,
                 sync_model_to_workers,
+                sync_metadata_to_workers,
                 make_distributed_weight_loader,
                 validate_memory_for_streaming,
+                init_oob,
             )
+            from .distributed.file_sync import detect_backend
             from .models.mlx_lm import MLX_LM
 
-            # Initialize distributed group first
+            # If hostfile provided, set up JACCL env vars BEFORE mx.distributed.init()
+            # This enables direct execution without mlx.launch wrapper
+            hosts = None
+            explicit_rank = None
+            if config.hostfile:
+                from .distributed.hostfile import (
+                    load_hostfile,
+                    setup_jaccl_env,
+                    get_oob_host_from_hostfile,
+                )
+
+                # Determine rank: CLI > env var
+                explicit_rank = config.rank
+                if explicit_rank is None:
+                    env_rank = os.environ.get("MLX_RANK")
+                    if env_rank is not None:
+                        explicit_rank = int(env_rank)
+                    else:
+                        raise ValueError(
+                            "--rank is required when using --hostfile "
+                            "(or set MLX_RANK environment variable)"
+                        )
+
+                # Load hostfile and set up JACCL environment
+                hosts = load_hostfile(config.hostfile)
+                setup_jaccl_env(hosts, explicit_rank, config.jaccl_port)
+
+                # Initialize OOB BEFORE distributed init when using JACCL backend.
+                # OOB provides: 1) Startup gate (workers wait for rank 0)
+                #               2) Rendezvous for send/recv during weight streaming
+                # Only JACCL needs OOB - Ring has implicit sync, MPI has built-in rendezvous.
+                backend = config.backend or detect_backend()
+                if backend == "jaccl":
+                    # Always use IP from hostfile for OOB - ensures TCPStore only
+                    # traverses TB5 link, not public interfaces. Ignore hostname overrides.
+                    oob_host = get_oob_host_from_hostfile(hosts)
+                    oob_port = config.oob_port or int(os.environ.get("MLX_OOB_PORT", "29400"))
+                    world_size = len(hosts)
+                    oob = init_oob(explicit_rank, world_size, oob_host, oob_port)
+                    logger.info(
+                        f"[Rank {explicit_rank}] JACCL OOB initialized on TB5 -> "
+                        f"{oob_host}:{oob_port}"
+                    )
+                else:
+                    oob = None
+                    logger.info(f"[Rank {explicit_rank}] Backend={backend}, OOB not needed")
+
+            # Initialize distributed group (reads MLX_RANK, MLX_JACCL_COORDINATOR, etc.)
             group = mx.distributed.init()
             rank = group.rank()
+            world_size = group.size()
+
+            # Initialize OOB for mlx.launch mode (after distributed init, since
+            # mlx.launch handles startup ordering). Skip if already initialized via hostfile.
+            # Only JACCL needs OOB - Ring has implicit sync, MPI has built-in rendezvous.
+            if not config.hostfile:
+                backend = config.backend or detect_backend()
+                if backend == "jaccl":
+                    oob_host = config.oob_host or os.environ.get("MLX_OOB_HOST")
+                    oob_port = config.oob_port or int(os.environ.get("MLX_OOB_PORT", "29400"))
+                    if oob_host:
+                        oob = init_oob(rank, world_size, oob_host, oob_port)
+                        logger.info(f"[Rank {rank}] JACCL OOB initialized -> {oob_host}:{oob_port}")
+                    else:
+                        oob = None
+                        logger.warning(f"[Rank {rank}] JACCL backend but no OOB host configured")
+                else:
+                    oob = None
+                    logger.info(f"[Rank {rank}] Backend={backend}, OOB not needed")
 
             # Resolve sync mode: auto uses sharded for pipeline, full for tensor
             sync_mode = config.file_sync
@@ -132,6 +202,19 @@ async def start(config: MLXServerConfig) -> None:
             weight_loader = None
             if sync_mode == "memory":
                 logger.info(f"[Rank {rank}] Using memory-based weight streaming")
+
+                # Sync metadata files (configs, tokenizer) to workers first.
+                # This ensures sharded_load's _download finds local files and
+                # doesn't try to download from HuggingFace on workers.
+                model_path = sync_metadata_to_workers(
+                    config.model_path,
+                    group,
+                    worker_model_path=config.worker_model_path,
+                )
+                # Update config with resolved local path for workers
+                if rank != 0:
+                    config.model_path = str(model_path)
+
                 # Validate memory before starting (fail early if insufficient)
                 validate_memory_for_streaming(config.model_path, group)
                 weight_loader = make_distributed_weight_loader(

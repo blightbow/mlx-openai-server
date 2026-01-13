@@ -203,6 +203,42 @@ def cli():
     type=str,
     help="Override model path for worker ranks. Use 'hf-cache' to store in HuggingFace cache structure. Default: same as --model-path.",
 )
+@click.option(
+    "--backend",
+    type=click.Choice(["ring", "mpi", "nccl", "jaccl"]),
+    default=None,
+    help="Distributed backend (same values as mlx.launch). Auto-detected if not specified. OOB coordination only enabled for 'jaccl'.",
+)
+@click.option(
+    "--oob-host",
+    default=None,
+    type=str,
+    help="Coordinator IP/hostname for JACCL OOB rendezvous (PyTorch TCPStore). Only used when --backend=jaccl. Falls back to MLX_OOB_HOST env var.",
+)
+@click.option(
+    "--oob-port",
+    default=29400,
+    type=int,
+    help="TCP port for JACCL OOB rendezvous. Default: 29400.",
+)
+@click.option(
+    "--hostfile",
+    default=None,
+    type=str,
+    help="Path to mlx.launch format hostfile (JSON). Enables direct execution without mlx.launch wrapper. Use with --rank to specify this node's rank.",
+)
+@click.option(
+    "--rank",
+    default=None,
+    type=int,
+    help="This node's rank for distributed inference. Overrides MLX_RANK env var. Required when using --hostfile.",
+)
+@click.option(
+    "--jaccl-port",
+    default=32323,
+    type=int,
+    help="JACCL coordinator port. Default: 32323.",
+)
 def launch(
     model_path,
     model_type,
@@ -228,6 +264,12 @@ def launch(
     distributed,
     file_sync,
     worker_model_path,
+    backend,
+    oob_host,
+    oob_port,
+    hostfile,
+    rank,
+    jaccl_port,
 ) -> None:
     """Start the FastAPI/Uvicorn server with the supplied flags.
 
@@ -261,6 +303,12 @@ def launch(
         distributed=distributed,
         file_sync=file_sync,
         worker_model_path=worker_model_path,
+        backend=backend,
+        oob_host=oob_host,
+        oob_port=oob_port,
+        hostfile=hostfile,
+        rank=rank,
+        jaccl_port=jaccl_port,
     )
 
     asyncio.run(start(args))

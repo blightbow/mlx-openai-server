@@ -17,14 +17,29 @@ from .coordinator import (
 )
 from .file_sync import (
     sync_model_to_workers,
+    sync_metadata_to_workers,
     check_disk_space,
     get_cache_path,
     make_distributed_weight_loader,
     validate_memory_for_streaming,
+    oob_send_file_bytes,
+    oob_recv_file_bytes,
     FileSyncError,
     DiskSpaceError,
     MemoryError,
     TransferError,
+)
+from .oob import (
+    OOBCoordinator,
+    init_oob,
+    get_oob,
+    oob_barrier,
+)
+from .hostfile import (
+    HostConfig,
+    load_hostfile,
+    setup_jaccl_env,
+    get_oob_host_from_hostfile,
 )
 
 __all__ = [
@@ -35,12 +50,25 @@ __all__ = [
     "PARAM_COUNT",
     # File sync
     "sync_model_to_workers",
+    "sync_metadata_to_workers",
     "check_disk_space",
     "get_cache_path",
     "make_distributed_weight_loader",
     "validate_memory_for_streaming",
+    "oob_send_file_bytes",
+    "oob_recv_file_bytes",
     "FileSyncError",
     "DiskSpaceError",
     "MemoryError",
     "TransferError",
+    # Out-of-band coordination
+    "OOBCoordinator",
+    "init_oob",
+    "get_oob",
+    "oob_barrier",
+    # Hostfile (direct execution without mlx.launch)
+    "HostConfig",
+    "load_hostfile",
+    "setup_jaccl_env",
+    "get_oob_host_from_hostfile",
 ]

@@ -1,6 +1,8 @@
 import gc
 import inspect
+import json
 import os
+from pathlib import Path
 from typing import Any, Callable, Dict, Generator, List, Optional, Union
 
 import mlx.core as mx
@@ -8,16 +10,8 @@ from loguru import logger
 from mlx_lm.generate import generate, stream_generate
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
-from mlx_lm.utils import load, sharded_load
+from mlx_lm.utils import load, load_config, load_tokenizer
 from outlines.processors import JSONLogitsProcessor
-
-# Verify mlx-lm has weight_loader support
-_sharded_load_sig = inspect.signature(sharded_load)
-if "weight_loader" not in _sharded_load_sig.parameters:
-    raise ImportError(
-        "Installed mlx-lm does not support the weight_loader parameter. "
-        "Please install a supported version of mlx-lm that includes this feature."
-    )
 
 from ..utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
 
@@ -86,17 +80,25 @@ class MLX_LM:
         trust_remote_code: bool = False,
         weight_loader: Optional[Callable[[str], Dict[str, Any]]] = None,
     ):
-        if self.distributed:
-            # sharded_load(path, pipeline_group, tensor_group, weight_loader)
-            # - tensor: shard weights within layers -> pass (None, group)
-            # - pipeline: shard weights between layers -> pass (group, None)
+        if self.distributed and weight_loader is not None:
+            # Distributed loading with custom weight_loader (e.g., streaming over TB5)
+            # We handle this directly instead of using sharded_load because:
+            # 1. Weight files don't exist locally on workers
+            # 2. We control file selection via the weight_loader
+            # 3. sharded_load assumes local files for its probe model
+            return self._distributed_load_with_weight_loader(
+                model_path, trust_remote_code, weight_loader
+            )
+        elif self.distributed:
+            # Standard distributed loading (files exist locally)
+            from mlx_lm.utils import sharded_load
             try:
                 if self.distributed == "pipeline":
                     logger.info(f"[Rank {self.rank}] Using pipeline parallelism")
-                    return sharded_load(model_path, self.group, None, weight_loader=weight_loader)
+                    return sharded_load(model_path, self.group, None)
                 else:  # tensor (default)
                     logger.info(f"[Rank {self.rank}] Using tensor parallelism")
-                    return sharded_load(model_path, None, self.group, weight_loader=weight_loader)
+                    return sharded_load(model_path, None, self.group)
             except ValueError as e:
                 error_msg = str(e)
                 if "does not support pipelining" in error_msg:
@@ -124,6 +126,199 @@ class MLX_LM:
             tokenizer_config={"trust_remote_code": trust_remote_code},
             weight_loader=weight_loader,
         )
+
+    def _distributed_load_with_weight_loader(
+        self,
+        model_path: str,
+        trust_remote_code: bool,
+        weight_loader: Callable[[str], Dict[str, Any]],
+    ):
+        """Load model for distributed inference with custom weight_loader.
+
+        This re-implements mlx_lm's load_model logic because the upstream version
+        assumes weights exist on local disk (uses glob + mx.load). Our weight_loader
+        streams weights via RDMA from rank 0, so workers don't have weight files.
+
+        The approach:
+        1. Use mlx_lm's load_config() - works because workers have config files
+        2. Import model architecture dynamically (same as mlx_lm._get_classes)
+        3. Call weight_loader for each file to collect weights via RDMA
+        4. Instantiate model with config
+        5. Handle sanitization and quantization
+        6. Load weights into model
+        7. Configure sharding (pipeline or tensor)
+        """
+        import importlib
+        import mlx.nn as nn
+
+        logger.info(f"[Rank {self.rank}] Using {self.distributed} parallelism with weight streaming")
+
+        model_path = Path(model_path)
+
+        # Get file list from weight_loader's manifest (already exchanged via OOB)
+        from ..distributed.file_sync import get_weight_loader_file_list
+        all_weight_files = get_weight_loader_file_list(weight_loader)
+
+        if all_weight_files is None:
+            # Fallback: read from index file (shouldn't happen with proper setup)
+            index_path = model_path / "model.safetensors.index.json"
+            if not index_path.exists():
+                raise ValueError(
+                    f"Distributed loading requires model.safetensors.index.json at {model_path}"
+                )
+            with open(index_path, "r") as f:
+                weight_index = json.load(f)["weight_map"]
+            all_weight_files = sorted(set(weight_index.values()))
+            logger.warning(f"[Rank {self.rank}] Using fallback file list from index")
+
+        weight_file_paths = [str(model_path / f) for f in all_weight_files]
+        logger.info(f"[Rank {self.rank}] Processing {len(weight_file_paths)} weight files via streaming")
+
+        # Load tokenizer (config files were synced to workers)
+        tokenizer = load_tokenizer(
+            model_path,
+            {"trust_remote_code": trust_remote_code},
+        )
+
+        # Step 1: Load config (workers have config files via sync_metadata_to_workers)
+        config = load_config(model_path)
+
+        # Step 2: Get model architecture classes (same logic as mlx_lm._get_classes)
+        MODEL_REMAPPING = {
+            "mistral": "llama",
+            "phi-msft": "phixtral",
+        }
+        model_type = config["model_type"]
+        model_type = MODEL_REMAPPING.get(model_type, model_type)
+        try:
+            arch = importlib.import_module(f"mlx_lm.models.{model_type}")
+        except ImportError:
+            raise ValueError(f"Model type {model_type} not supported by mlx_lm")
+        model_class = arch.Model
+        model_args_class = arch.ModelArgs
+
+        # Step 3: Load weights via weight_loader (streams from rank 0 via RDMA)
+        logger.info(f"[Rank {self.rank}] Loading weights via distributed streaming...")
+        weights = {}
+        for i, wf in enumerate(weight_file_paths):
+            logger.debug(f"[Rank {self.rank}] Loading weight file {i+1}/{len(weight_file_paths)}: {Path(wf).name}")
+            file_weights = weight_loader(wf)
+            weights.update(file_weights)
+            # Clear intermediate to reduce memory pressure
+            del file_weights
+
+        logger.info(f"[Rank {self.rank}] Loaded {len(weights)} weight tensors")
+
+        # Step 4: Instantiate model
+        model_args = model_args_class.from_dict(config)
+        model = model_class(model_args)
+
+        # Step 5: Sanitize weights if model supports it
+        if hasattr(model, "sanitize"):
+            weights = model.sanitize(weights)
+
+        # Step 6: Handle quantization (same logic as mlx_lm.load_model)
+        if (quantization := config.get("quantization", None)) is not None:
+            def class_predicate(p, m):
+                if p in config["quantization"]:
+                    return config["quantization"][p]
+                if not hasattr(m, "to_quantized"):
+                    return False
+                return f"{p}.scales" in weights
+
+            nn.quantize(
+                model,
+                group_size=quantization["group_size"],
+                bits=quantization["bits"],
+                mode=quantization.get("mode", "affine"),
+                class_predicate=class_predicate,
+            )
+
+        # Step 7: Load weights into model
+        model.load_weights(list(weights.items()), strict=False)
+        del weights  # Free weight dict
+
+        model.eval()
+
+        # CHECKPOINT: After load_model, before sharding
+        from ..distributed.file_sync import get_available_memory
+        mem_after_load = get_available_memory()
+        logger.info(f"[Rank {self.rank}] MEMORY after load_model: {mem_after_load / 1e9:.1f}GB available")
+
+        # Configure sharding based on distributed mode
+        if self.distributed == "tensor":
+            if not hasattr(model, "shard"):
+                raise ValueError(
+                    "Model does not support tensor parallelism. "
+                    "Try --distributed=pipeline instead."
+                )
+            model.shard(self.group)
+            # CHECKPOINT
+            mem_after_shard = get_available_memory()
+            logger.info(f"[Rank {self.rank}] MEMORY after shard(): {mem_after_shard / 1e9:.1f}GB available")
+        else:  # pipeline
+            # Configure pipeline parallelism via mlx_lm's built-in method
+            # This routes the forward pass so each rank only executes its layers
+            if not hasattr(model, "model") or not hasattr(model.model, "pipeline"):
+                raise ValueError(
+                    "Model does not support pipeline parallelism. "
+                    "Try --distributed=tensor instead."
+                )
+            model.model.pipeline(self.group)
+
+            mem_after_pipeline = get_available_memory()
+            logger.info(f"[Rank {self.rank}] MEMORY after pipeline(): {mem_after_pipeline / 1e9:.1f}GB available")
+
+            # APPROACH: Don't call mx.eval(model.parameters()) explicitly.
+            # Let lazy evaluation happen during the first forward pass.
+            # If pipeline() correctly routes computation, only our layers'
+            # parameters will be evaluated, avoiding OOM.
+            #
+            # Run a small forward pass to trigger lazy evaluation
+            logger.info(f"[Rank {self.rank}] Running warmup forward pass to materialize weights...")
+            warmup_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
+            try:
+                # Just run forward, don't care about output
+                _ = model(warmup_tokens)
+                mx.eval(_)
+            except Exception as e:
+                logger.warning(f"[Rank {self.rank}] Warmup forward pass failed: {e}")
+                # Fall back to explicit eval if warmup fails
+                logger.info(f"[Rank {self.rank}] Falling back to explicit parameter evaluation...")
+                mx.eval(model.parameters())
+
+            # Synchronize all ranks
+            mx.eval(
+                mx.distributed.all_sum(
+                    mx.array(1.0),
+                    stream=mx.default_stream(mx.Device(mx.cpu)),
+                    group=self.group,
+                )
+            )
+            logger.info(f"[Rank {self.rank}] Pipeline setup complete, barrier passed")
+
+            mem_after_eval = get_available_memory()
+            logger.info(f"[Rank {self.rank}] MEMORY after warmup: {mem_after_eval / 1e9:.1f}GB available (delta: {(mem_after_pipeline - mem_after_eval) / 1e9:.1f}GB)")
+
+        # Synchronize all ranks before returning
+        mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
+
+        # Diagnostic: verify parameters are materialized
+        params = mx.utils.tree_flatten(model.parameters())[0]
+        param_count = sum(p.size for p in params)
+        # Check if first param has actual data (not just lazy placeholder)
+        if params:
+            first_param = params[0]
+            # Accessing .item() on first element forces evaluation if lazy
+            try:
+                sample_val = first_param.flatten()[0].item()
+                logger.info(f"[Rank {self.rank}] Model loaded: {param_count:,} params, sample={sample_val:.6f}")
+            except Exception as e:
+                logger.warning(f"[Rank {self.rank}] Model loaded: {param_count:,} params, but sample access failed: {e}")
+
+        logger.info(f"[Rank {self.rank}] Model loaded and sharded successfully")
+
+        return model, tokenizer
         
     def _apply_pooling_strategy(self, embeddings: mx.array) -> mx.array:
         embeddings = mx.mean(embeddings, axis=1)

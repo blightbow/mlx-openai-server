@@ -1,8 +1,7 @@
 """Distributed file synchronization for multi-rank model loading.
 
 This module transfers model files from rank 0 to worker ranks using the
-mlx.launch distributed backend (JACCL, ring, or MPI). It leverages the same
-all_sum() broadcast pattern used for token coordination.
+mlx.launch distributed backend (JACCL, ring, or MPI).
 
 Key features:
 - Two-phase transfer: metadata first, then weight files
@@ -10,11 +9,15 @@ Key features:
 - Disk space validation before large transfers
 - Chunked transfers to stay within MPI limits
 - Backend-agnostic: works over JACCL/TB5 RDMA, ring/TCP, or MPI
+- OOB coordination: uses PyTorch TCPStore for receiver-initiated rendezvous
 
-The transfer uses all_sum() with zero-contribution pattern:
-- Rank 0 contributes actual file data
-- Workers contribute zeros
-- Result: data + 0 + 0 + ... = data (everyone gets rank 0's data)
+Transfer modes:
+- Memory mode (--file-sync=memory): Uses OOB-coordinated send/recv for targeted
+  file transfers. Receiver signals ready via OOB, sender waits then sends.
+  Solves JACCL's timing asymmetry issues that cause SIGBUS with raw send/recv.
+
+- Disk modes (--file-sync=full/sharded): Uses all_sum() broadcast pattern
+  for file transfers to disk. Rank 0 contributes data, workers contribute zeros.
 """
 
 import hashlib
@@ -22,13 +25,112 @@ import json
 import os
 import shutil
 import socket
+import struct
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Union
 
 import mlx.core as mx
 import numpy as np
-import safetensors.numpy
 from loguru import logger
+
+
+# Safetensors dtype string -> (numpy dtype for raw bytes, mlx dtype, element size)
+# For types numpy doesn't support natively (BF16), we use uint of same size
+SAFETENSOR_DTYPE_MAP = {
+    "F64": (np.float64, mx.float64, 8),
+    "F32": (np.float32, mx.float32, 4),
+    "F16": (np.float16, mx.float16, 2),
+    "BF16": (np.uint16, mx.bfloat16, 2),  # numpy lacks bfloat16, use uint16
+    "I64": (np.int64, mx.int64, 8),
+    "I32": (np.int32, mx.int32, 4),
+    "I16": (np.int16, mx.int16, 2),
+    "I8": (np.int8, mx.int8, 1),
+    "U64": (np.uint64, mx.uint64, 8),
+    "U32": (np.uint32, mx.uint32, 4),
+    "U16": (np.uint16, mx.uint16, 2),
+    "U8": (np.uint8, mx.uint8, 1),
+    "BOOL": (np.bool_, mx.bool_, 1),
+}
+
+
+def parse_safetensors(data: bytes, log_file=None) -> Dict[str, mx.array]:
+    """Parse safetensors format from bytes, returning MLX arrays.
+
+    Zero-copy optimized: uses np.frombuffer with offset to read directly
+    from the source buffer without intermediate copies. This handles BF16
+    which safetensors.numpy doesn't support.
+
+    Args:
+        data: Raw safetensors file bytes
+        log_file: Optional file handle for timing logs
+
+    Returns:
+        Dictionary mapping tensor names to mx.array
+    """
+    t_start = time.perf_counter()
+
+    # Parse header size (first 8 bytes, little-endian uint64)
+    header_size = struct.unpack("<Q", data[:8])[0]
+
+    # Parse JSON header
+    header_json = data[8:8 + header_size].decode("utf-8")
+    header = json.loads(header_json)
+    t_header = time.perf_counter()
+
+    # Data section starts after header
+    data_offset = 8 + header_size
+
+    tensors = {}
+    tensor_count = 0
+    for name, info in header.items():
+        # Skip metadata entry
+        if name == "__metadata__":
+            continue
+
+        dtype_str = info["dtype"]
+        shape = info["shape"]
+        start, end = info["data_offsets"]
+
+        if dtype_str not in SAFETENSOR_DTYPE_MAP:
+            raise ValueError(f"Unsupported safetensors dtype: {dtype_str}")
+
+        np_dtype, mx_dtype, elem_size = SAFETENSOR_DTYPE_MAP[dtype_str]
+
+        # Calculate element count
+        byte_count = end - start
+        elem_count = byte_count // elem_size
+
+        # Zero-copy view into original buffer using offset
+        np_array = np.frombuffer(
+            data, dtype=np_dtype, count=elem_count, offset=data_offset + start
+        ).reshape(shape)
+
+        # Single copy to MLX unified memory
+        if dtype_str == "BF16":
+            mx_array = mx.array(np_array, dtype=mx.uint16)
+            tensors[name] = mx_array.view(mx.bfloat16)
+        else:
+            tensors[name] = mx.array(np_array, dtype=mx_dtype)
+
+        tensor_count += 1
+
+    # Evaluate all tensors immediately to prevent lazy graph accumulation.
+    # Without this, MLX builds up computation graphs across all files,
+    # causing OOM when finally evaluated.
+    mx.eval(tensors)
+
+    t_end = time.perf_counter()
+
+    if log_file:
+        log_file.write(
+            f"  parse: header={1000*(t_header-t_start):.1f}ms, "
+            f"tensors={1000*(t_end-t_header):.1f}ms ({tensor_count} tensors), "
+            f"total={1000*(t_end-t_start):.1f}ms\n"
+        )
+        log_file.flush()
+
+    return tensors
 
 # Chunk size limits by backend
 CHUNK_SIZE_MPI = 256 * 1024 * 1024      # 256 MB (MPI int32 limit safety margin)
@@ -371,7 +473,7 @@ def broadcast_manifest(
         mx.eval(name_result)
 
         # Decode filename
-        name_bytes = bytes(name_result[:name_len].tolist())
+        name_bytes = np.array(name_result[:name_len], copy=False).tobytes()
         filename = name_bytes.decode('utf-8')
 
         manifest.append((filename, file_size))
@@ -441,7 +543,7 @@ def transfer_file(
 
             # Workers write chunk
             if rank != 0:
-                chunk_data = bytes(result[:this_chunk_size].tolist())
+                chunk_data = np.array(result[:this_chunk_size], copy=False).tobytes()
                 dst_file.write(chunk_data)
 
             bytes_transferred += this_chunk_size
@@ -772,22 +874,124 @@ def sync_model_to_workers(
         return dst_path
 
 
+def sync_metadata_to_workers(
+    model_path: str,
+    group: mx.distributed.Group,
+    worker_model_path: Optional[str] = None,
+) -> Path:
+    """Sync only metadata files (configs, tokenizer) for memory-based weight loading.
+
+    This is used in memory streaming mode where weight files are broadcast via
+    all_sum but config files need to be on disk for mlx-lm's model loading.
+
+    Args:
+        model_path: HuggingFace model ID or local path
+        group: MLX distributed group
+        worker_model_path: Override path for workers, "hf-cache", or None
+
+    Returns:
+        Local path to model directory (usable by all ranks)
+
+    Raises:
+        FileNotFoundError: If model not found on rank 0
+    """
+    rank = group.rank()
+    size = group.size()
+
+    if size == 1:
+        # Single rank, no sync needed
+        return Path(model_path) if os.path.exists(model_path) else get_cache_path(model_path)
+
+    # Determine destination path for workers
+    if rank == 0:
+        dst_path = Path(model_path)
+    else:
+        dst_path = resolve_worker_path(model_path, worker_model_path)
+
+    logger.info(f"{get_node_prefix(rank)} Syncing metadata files for memory mode")
+
+    # Detect backend and select chunk size
+    backend = detect_backend()
+    chunk_size = get_chunk_size(backend)
+
+    # Rank 0: resolve model path
+    if rank == 0:
+        src_path = Path(model_path)
+        if not src_path.exists():
+            from huggingface_hub import snapshot_download
+            try:
+                src_path = Path(snapshot_download(model_path))
+                logger.info(f"[Rank 0] Model resolved to {src_path}")
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"Model not found locally or on HuggingFace: {model_path}"
+                ) from e
+
+        files = get_model_files(src_path)
+    else:
+        src_path = None
+        files = None
+
+    # Broadcast manifest to all ranks
+    manifest = broadcast_manifest(files, group)
+
+    # Only sync metadata files (small configs, tokenizer)
+    metadata_files = get_metadata_files(manifest)
+
+    # Create destination directory for workers
+    if rank != 0:
+        dst_path.mkdir(parents=True, exist_ok=True)
+
+    # Transfer metadata files
+    logger.info(
+        f"{get_node_prefix(rank)} Transferring {len(metadata_files)} metadata files"
+    )
+    for filename, file_size in metadata_files:
+        if rank == 0:
+            file_src = src_path / filename
+        else:
+            file_src = None
+        file_dst = dst_path / filename
+        transfer_file(file_src, file_dst, file_size, group, chunk_size)
+
+    metadata_size = sum(fsize for _, fsize in metadata_files)
+    logger.info(
+        f"{get_node_prefix(rank)} Metadata sync complete: "
+        f"{len(metadata_files)} files, {metadata_size / 1e6:.1f}MB"
+    )
+
+    # Return the appropriate path
+    if rank == 0:
+        return src_path
+    else:
+        return dst_path
+
+
 def broadcast_file_bytes(
     file_path: str,
     group: mx.distributed.Group,
     chunk_size: Optional[int] = None,
-) -> Union[bytes, bytearray]:
+    log_file=None,
+) -> bytearray:
     """Broadcast file bytes from rank 0 to all ranks via all_sum.
+
+    Optimized to minimize intermediate copies:
+    - Uses numpy views with offset instead of byte slicing
+    - Pre-allocates output buffer (single allocation)
+    - Reuses padded chunk buffer on rank 0
+    - Returns bytearray directly (no final copy)
 
     Args:
         file_path: Path to file (only read on rank 0)
         group: MLX distributed group
         chunk_size: Override chunk size (auto-detected if None)
+        log_file: Optional file handle for timing logs
 
     Returns:
-        File bytes on all ranks (bytearray for memory efficiency)
+        File bytes as bytearray on all ranks
     """
     rank = group.rank()
+    t_start = time.perf_counter()
 
     if chunk_size is None:
         chunk_size = get_chunk_size()
@@ -801,6 +1005,8 @@ def broadcast_file_bytes(
         file_bytes = None
         size_array = mx.zeros((1,), dtype=mx.int64)
 
+    t_read = time.perf_counter()
+
     # Broadcast file size
     size_result = mx.distributed.all_sum(size_array, group=group)
     mx.eval(size_result)
@@ -808,45 +1014,352 @@ def broadcast_file_bytes(
     del size_array, size_result
 
     if file_size == 0:
-        return b""
+        return bytearray()
 
     # Calculate chunks
     num_chunks = (file_size + chunk_size - 1) // chunk_size
 
-    # Collect all chunks
-    result_bytes = bytearray()
+    # OPTIMIZATION: Rank 0 already has the file data. Since all_sum result = data + zeros = data,
+    # Rank 0 doesn't need an output buffer - it can return its original file_bytes.
+    # This halves Rank 0's memory usage per file.
+    if rank != 0:
+        # Only non-zero ranks need an output buffer
+        output = bytearray(file_size)
+
     bytes_transferred = 0
 
+    # Pre-allocate reusable padded buffer for rank 0 (avoids repeated allocation)
+    if rank == 0:
+        padded_buffer = np.zeros(chunk_size, dtype=np.uint8)
+
+    t_alloc = time.perf_counter()
+    chunk_times = []
+
     for chunk_idx in range(num_chunks):
+        t_chunk_start = time.perf_counter()
         remaining = file_size - bytes_transferred
         this_chunk_size = min(chunk_size, remaining)
 
         if rank == 0:
-            chunk_data = file_bytes[bytes_transferred:bytes_transferred + this_chunk_size]
-            # Pad to chunk size for consistent all_sum
-            if len(chunk_data) < chunk_size:
-                chunk_data = chunk_data + b'\x00' * (chunk_size - len(chunk_data))
-            chunk = mx.array(np.frombuffer(chunk_data, dtype=np.uint8))
+            # Zero-copy view into source bytes, copy into pre-allocated padded buffer
+            src_view = np.frombuffer(
+                file_bytes, dtype=np.uint8, count=this_chunk_size, offset=bytes_transferred
+            )
+            padded_buffer[:this_chunk_size] = src_view
+            # Zero padding for remainder (only needed if chunk is partial)
+            if this_chunk_size < chunk_size:
+                padded_buffer[this_chunk_size:] = 0
+            chunk = mx.array(padded_buffer)
         else:
             chunk = mx.zeros((chunk_size,), dtype=mx.uint8)
+
+        t_prep = time.perf_counter()
 
         result = mx.distributed.all_sum(chunk, group=group)
         mx.eval(result)
 
-        # Extract actual data (not padding) - use numpy for efficient conversion
-        result_bytes.extend(np.array(result[:this_chunk_size], copy=False).tobytes())
+        t_allsum = time.perf_counter()
+
+        # Only non-zero ranks need to copy the result - rank 0 already has the data
+        if rank != 0:
+            np.copyto(
+                np.frombuffer(output, dtype=np.uint8, count=this_chunk_size, offset=bytes_transferred),
+                np.array(result[:this_chunk_size], copy=False)
+            )
         bytes_transferred += this_chunk_size
 
         # Free MLX arrays immediately
         del chunk, result
 
-    # Release MLX memory cache and source bytes
-    mx.clear_cache()
-    if file_bytes is not None:
-        del file_bytes
+        t_chunk_end = time.perf_counter()
+        chunk_times.append({
+            'prep': t_prep - t_chunk_start,
+            'allsum': t_allsum - t_prep,
+            'copy': t_chunk_end - t_allsum,
+        })
 
-    # Return bytearray directly - safetensors can handle it, avoids copy
-    return result_bytes
+    mx.clear_cache()
+
+    t_end = time.perf_counter()
+
+    if log_file:
+        file_size_mb = file_size / 1e6
+        total_ms = 1000 * (t_end - t_start)
+        read_ms = 1000 * (t_read - t_start)
+        alloc_ms = 1000 * (t_alloc - t_read)
+        transfer_ms = 1000 * (t_end - t_alloc)
+        throughput = file_size_mb / (t_end - t_start) if (t_end - t_start) > 0 else 0
+
+        # Aggregate chunk timing
+        total_prep = sum(c['prep'] for c in chunk_times) * 1000
+        total_allsum = sum(c['allsum'] for c in chunk_times) * 1000
+        total_copy = sum(c['copy'] for c in chunk_times) * 1000
+
+        log_file.write(
+            f"  broadcast: {file_size_mb:.1f}MB in {total_ms:.0f}ms ({throughput:.0f}MB/s)\n"
+            f"    read={read_ms:.0f}ms, alloc={alloc_ms:.0f}ms, transfer={transfer_ms:.0f}ms\n"
+            f"    chunks({num_chunks}): prep={total_prep:.0f}ms, allsum={total_allsum:.0f}ms, copy={total_copy:.0f}ms\n"
+        )
+        log_file.flush()
+
+    # Return appropriate buffer - rank 0 uses original file_bytes (no copy), others use output
+    # parse_safetensors accepts both bytes and bytearray via np.frombuffer
+    if rank == 0:
+        return file_bytes  # Return original bytes directly, no copy
+    else:
+        return output
+
+
+def send_file_bytes(
+    data: bytes,
+    group: mx.distributed.Group,
+    dst_rank: int,
+    chunk_size: Optional[int] = None,
+    log_file=None,
+) -> None:
+    """Send bytes to a specific destination rank via send().
+
+    Only called on rank 0. Uses chunked transfer for large data.
+
+    Args:
+        data: Bytes to send
+        group: MLX distributed group
+        dst_rank: Destination rank (must be != 0)
+        chunk_size: Override chunk size (auto-detected if None)
+        log_file: Optional file handle for timing logs
+    """
+    t_start = time.perf_counter()
+
+    if chunk_size is None:
+        chunk_size = get_chunk_size()
+
+    file_bytes = data
+    file_size = len(file_bytes)
+
+    # Send file size first
+    # CRITICAL: Must eval the RESULT of send(), not the input.
+    # send() returns a dependency-tracked array; eval triggers the actual send.
+    # See Issue #1849: "send is an operation in the graph... must be evaluated"
+    size_array = mx.array([file_size], dtype=mx.int64)
+    sent_size = mx.distributed.send(size_array, dst_rank, group=group)
+    mx.eval(sent_size)
+    del size_array, sent_size
+
+    if file_size == 0:
+        return
+
+    # Calculate chunks
+    num_chunks = (file_size + chunk_size - 1) // chunk_size
+
+    # Pre-allocate reusable padded buffer
+    padded_buffer = np.zeros(chunk_size, dtype=np.uint8)
+    bytes_sent = 0
+
+    t_alloc = time.perf_counter()
+
+    for chunk_idx in range(num_chunks):
+        remaining = file_size - bytes_sent
+        this_chunk_size = min(chunk_size, remaining)
+
+        # Zero-copy view into source bytes
+        src_view = np.frombuffer(
+            file_bytes, dtype=np.uint8, count=this_chunk_size, offset=bytes_sent
+        )
+        padded_buffer[:this_chunk_size] = src_view
+        if this_chunk_size < chunk_size:
+            padded_buffer[this_chunk_size:] = 0
+
+        chunk = mx.array(padded_buffer)
+        # CRITICAL: Eval the send result, not the input chunk
+        sent = mx.distributed.send(chunk, dst_rank, group=group)
+        mx.eval(sent)
+
+        bytes_sent += this_chunk_size
+        del chunk, sent
+
+    t_end = time.perf_counter()
+
+    if log_file:
+        file_size_mb = file_size / 1e6
+        total_ms = 1000 * (t_end - t_start)
+        send_ms = 1000 * (t_end - t_alloc)
+        throughput = file_size_mb / (t_end - t_start) if (t_end - t_start) > 0 else 0
+
+        log_file.write(
+            f"  send: {file_size_mb:.1f}MB in {total_ms:.0f}ms ({throughput:.0f}MB/s)\n"
+            f"    transfer={send_ms:.0f}ms ({num_chunks} chunks)\n"
+        )
+        log_file.flush()
+
+    mx.clear_cache()
+
+
+def recv_file_bytes(
+    group: mx.distributed.Group,
+    src_rank: int,
+    chunk_size: Optional[int] = None,
+    log_file=None,
+) -> bytearray:
+    """Receive file bytes from a source rank via recv_like().
+
+    Only called on non-zero ranks. Uses chunked transfer for large files.
+
+    Args:
+        group: MLX distributed group
+        src_rank: Source rank (must be 0)
+        chunk_size: Override chunk size (auto-detected if None)
+        log_file: Optional file handle for timing logs
+
+    Returns:
+        File bytes as bytearray
+    """
+    t_start = time.perf_counter()
+
+    if chunk_size is None:
+        chunk_size = get_chunk_size()
+
+    # Receive file size first
+    size_template = mx.zeros((1,), dtype=mx.int64)
+    size_array = mx.distributed.recv_like(size_template, src_rank, group=group)
+    mx.eval(size_array)
+    file_size = int(size_array[0].item())
+    del size_template, size_array
+
+    if file_size == 0:
+        return bytearray()
+
+    # Calculate chunks
+    num_chunks = (file_size + chunk_size - 1) // chunk_size
+
+    # Pre-allocate output buffer
+    output = bytearray(file_size)
+    bytes_received = 0
+
+    t_alloc = time.perf_counter()
+
+    # Template for receiving chunks
+    chunk_template = mx.zeros((chunk_size,), dtype=mx.uint8)
+
+    for chunk_idx in range(num_chunks):
+        remaining = file_size - bytes_received
+        this_chunk_size = min(chunk_size, remaining)
+
+        result = mx.distributed.recv_like(chunk_template, src_rank, group=group)
+        mx.eval(result)
+
+        # Copy into pre-allocated output buffer
+        np.copyto(
+            np.frombuffer(output, dtype=np.uint8, count=this_chunk_size, offset=bytes_received),
+            np.array(result[:this_chunk_size], copy=False)
+        )
+        bytes_received += this_chunk_size
+        del result
+
+    t_end = time.perf_counter()
+
+    if log_file:
+        file_size_mb = file_size / 1e6
+        total_ms = 1000 * (t_end - t_start)
+        recv_ms = 1000 * (t_end - t_alloc)
+        throughput = file_size_mb / (t_end - t_start) if (t_end - t_start) > 0 else 0
+
+        log_file.write(
+            f"  recv: {file_size_mb:.1f}MB in {total_ms:.0f}ms ({throughput:.0f}MB/s)\n"
+            f"    recv={recv_ms:.0f}ms ({num_chunks} chunks)\n"
+        )
+        log_file.flush()
+
+    del chunk_template
+    mx.clear_cache()
+
+    return output
+
+
+def oob_send_file_bytes(
+    data: bytes,
+    group: mx.distributed.Group,
+    dst_rank: int,
+    transfer_id: str,
+    chunk_size: Optional[int] = None,
+    log_file=None,
+) -> None:
+    """Send bytes with OOB receiver-initiated rendezvous.
+
+    This implements the safe pattern for JACCL:
+    1. Wait for receiver to signal ready (via OOB)
+    2. Send data chunks (receiver has already posted recv)
+    3. Signal completion (via OOB)
+
+    Args:
+        data: Bytes to send
+        group: MLX distributed group
+        dst_rank: Destination rank
+        transfer_id: Unique identifier for this transfer (for OOB coordination)
+        chunk_size: Override chunk size (auto-detected if None)
+        log_file: Optional file handle for timing logs
+    """
+    from .oob import get_oob
+
+    oob = get_oob()
+    if oob is None:
+        raise RuntimeError(
+            "OOB coordinator not initialized. "
+            "Call init_oob() or set MLX_OOB_HOST before using oob_send_file_bytes."
+        )
+
+    # Wait for receiver to signal ready
+    oob.wait_ready(transfer_id, dst_rank)
+
+    # Now safe to send - receiver has posted recv
+    send_file_bytes(data, group, dst_rank, chunk_size, log_file)
+
+    # Signal completion
+    oob.signal_complete(transfer_id)
+
+
+def oob_recv_file_bytes(
+    group: mx.distributed.Group,
+    src_rank: int,
+    transfer_id: str,
+    chunk_size: Optional[int] = None,
+    log_file=None,
+) -> bytearray:
+    """Receive bytes with OOB receiver-initiated rendezvous.
+
+    This implements the safe pattern for JACCL:
+    1. Signal ready (via OOB) - tells sender we've posted recv
+    2. Receive data chunks
+    3. Wait for sender's completion signal (via OOB)
+
+    Args:
+        group: MLX distributed group
+        src_rank: Source rank
+        transfer_id: Unique identifier for this transfer (for OOB coordination)
+        chunk_size: Override chunk size (auto-detected if None)
+        log_file: Optional file handle for timing logs
+
+    Returns:
+        File bytes as bytearray
+    """
+    from .oob import get_oob
+
+    oob = get_oob()
+    if oob is None:
+        raise RuntimeError(
+            "OOB coordinator not initialized. "
+            "Call init_oob() or set MLX_OOB_HOST before using oob_recv_file_bytes."
+        )
+
+    # Signal we're ready to receive
+    oob.signal_ready(transfer_id)
+
+    # Receive the data
+    result = recv_file_bytes(group, src_rank, chunk_size, log_file)
+
+    # Wait for sender to confirm completion
+    oob.wait_complete(transfer_id, src_rank)
+
+    return result
 
 
 def make_distributed_weight_loader(
@@ -854,18 +1367,17 @@ def make_distributed_weight_loader(
     model_path: str = None,
     distributed_mode: str = None,
 ) -> Callable[[str], Dict[str, Any]]:
-    """Create a weight loader that streams weights via distributed broadcast.
+    """Create a weight loader using OOB-coordinated send/recv for JACCL transfers.
 
     This loader is designed to be passed to mlx_lm's load() function via the
-    weight_loader parameter. Instead of each rank reading from disk, rank 0
-    reads the file and broadcasts bytes to all other ranks via all_sum().
+    weight_loader parameter. Uses OOB (out-of-band) coordination via PyTorch
+    TCPStore to implement receiver-initiated rendezvous, solving JACCL's timing
+    asymmetry issues that cause SIGBUS with raw send/recv.
 
-    The weights are parsed from safetensors format in memory, avoiding the
-    need for disk storage on worker ranks.
+    For pipeline parallelism, only sends files to ranks that need them.
+    For tensor parallelism, broadcasts all files to all ranks.
 
-    For pipeline parallelism, files not needed by this rank are discarded
-    immediately after the collective broadcast (before parsing) to avoid
-    accumulating unnecessary weights in memory.
+    Requires OOB coordinator to be initialized via init_oob() before calling.
 
     Args:
         group: MLX distributed group
@@ -877,18 +1389,38 @@ def make_distributed_weight_loader(
 
     Example:
         >>> group = mx.distributed.init()
+        >>> init_oob(rank, world_size, "coordinator_host", 29400)
         >>> loader = make_distributed_weight_loader(group, model_path, "pipeline")
         >>> model, tokenizer = load(model_path, weight_loader=loader)
     """
+    from .oob import get_oob
+
     rank = group.rank()
     world_size = group.size()
     backend = detect_backend()
     chunk_size = get_chunk_size(backend)
 
+    # Get OOB coordinator for synchronization
+    oob = get_oob()
+    if oob is None:
+        raise RuntimeError(
+            "OOB coordinator not initialized. Call init_oob() before "
+            "make_distributed_weight_loader(). OOB is required for reliable "
+            "send/recv coordination over JACCL."
+        )
+
     # For pipeline parallelism, compute which files each rank needs
-    # Rank 0 computes for ALL ranks and broadcasts (workers don't have model files)
-    needed_files = None
+    # We need to know BOTH rank's needs to route files correctly
+    rank0_files = None
+    rank1_files = None
+
+    # File list for load_model (set on the returned loader function)
+    file_order = None
+
     if distributed_mode == "pipeline" and model_path:
+        # Use OOB-coordinated send/recv for manifest exchange.
+        # OOB provides receiver-initiated rendezvous to avoid JACCL timing issues.
+
         if rank == 0:
             src_path = Path(model_path)
             if not src_path.exists():
@@ -898,112 +1430,218 @@ def make_distributed_weight_loader(
             index_path = src_path / "model.safetensors.index.json"
             config_path = src_path / "config.json"
 
+            # Read full file list from index
+            with open(index_path, "r") as f:
+                weight_index = json.load(f)["weight_map"]
+            all_weight_files = sorted(set(weight_index.values()))
+
             # Compute needed files for ALL ranks
             all_rank_files = {}
-            if index_path.exists() and config_path.exists():
+            if config_path.exists():
                 for r in range(world_size):
                     files = compute_pipeline_files(index_path, config_path, r, world_size)
                     all_rank_files[r] = list(files) if files else None
 
-            # Serialize and broadcast
-            manifest_json = json.dumps(all_rank_files).encode("utf-8")
-            manifest_size = len(manifest_json)
-            size_array = mx.array([manifest_size], dtype=mx.int64)
-        else:
-            size_array = mx.zeros((1,), dtype=mx.int64)
+            # Build manifest with file order and rank assignments
+            manifest = {
+                "file_order": all_weight_files,
+                "rank_files": all_rank_files,
+            }
 
-        # Broadcast manifest size
-        size_result = mx.distributed.all_sum(size_array, group=group)
-        mx.eval(size_result)
-        manifest_size = int(size_result[0].item())
-        del size_array, size_result
+            # Serialize manifest
+            manifest_json = json.dumps(manifest).encode("utf-8")
 
-        if manifest_size > 0:
-            # Broadcast manifest data
-            if rank == 0:
-                manifest_array = mx.array(np.frombuffer(manifest_json, dtype=np.uint8))
-                # Pad to consistent size for all_sum
-                padded = mx.zeros((manifest_size,), dtype=mx.uint8)
-                padded = manifest_array
-            else:
-                padded = mx.zeros((manifest_size,), dtype=mx.uint8)
-
-            result = mx.distributed.all_sum(padded, group=group)
-            mx.eval(result)
-
-            # Deserialize
-            manifest_bytes = bytes(np.array(result, copy=False).tobytes())
-            all_rank_files = json.loads(manifest_bytes.decode("utf-8"))
-            del padded, result
-
-            # Extract this rank's needed files
-            rank_key = str(rank)  # JSON keys are strings
             logger.info(
-                f"{get_node_prefix(rank)} Manifest received: "
-                f"keys={list(all_rank_files.keys())}"
+                f"{get_node_prefix(rank)} Sending manifest ({len(manifest_json)} bytes) "
+                f"to {world_size - 1} workers"
             )
-            if rank_key in all_rank_files and all_rank_files[rank_key]:
-                needed_files = set(all_rank_files[rank_key])
-                logger.info(
-                    f"{get_node_prefix(rank)} Pipeline mode: need {len(needed_files)} "
-                    f"of total weight files"
-                )
-            else:
-                logger.warning(
-                    f"{get_node_prefix(rank)} No files found in manifest for this rank! "
-                    f"rank_key={rank_key}, has_key={rank_key in all_rank_files}"
-                )
+
+            # Send manifest to each worker via OOB-coordinated send
+            for dst_rank in range(1, world_size):
+                transfer_id = f"manifest_to_rank{dst_rank}"
+                oob_send_file_bytes(manifest_json, group, dst_rank, transfer_id,
+                                    chunk_size=chunk_size)
+
+            # Extract for local use
+            file_order = manifest.get("file_order", [])
+            all_rank_files_dict = manifest.get("rank_files", {})
+        else:
+            # Workers receive manifest via OOB-coordinated recv
+            transfer_id = f"manifest_to_rank{rank}"
+            manifest_bytes = oob_recv_file_bytes(group, src_rank=0, transfer_id=transfer_id,
+                                                  chunk_size=chunk_size)
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+            del manifest_bytes
+
+            # Extract file order and rank assignments
+            file_order = manifest.get("file_order", [])
+            all_rank_files_dict = manifest.get("rank_files", {})
+
+        # Extract file sets (JSON keys are strings when deserialized)
+        rank0_files = set(all_rank_files_dict.get(0, all_rank_files_dict.get("0", [])) or [])
+        rank1_files = set(all_rank_files_dict.get(1, all_rank_files_dict.get("1", [])) or [])
+
+        logger.info(
+            f"{get_node_prefix(rank)} Pipeline mode: {len(file_order)} total files, "
+            f"rank0 needs {len(rank0_files)}, rank1 needs {len(rank1_files)}"
+        )
+
+        # MANIFEST CHECKPOINT: Use OOB barrier to ensure all ranks received manifest
+        oob.barrier("manifest_exchange")
+        logger.info(f"{get_node_prefix(rank)} Manifest checkpoint OK: all ranks in sync")
 
     logger.info(
         f"{get_node_prefix(rank)} Created distributed weight loader "
-        f"(backend={backend}, chunk_size={chunk_size // 1024 // 1024}MB)"
+        f"(backend={backend}, chunk_size={chunk_size // 1024 // 1024}MB, mode=OOB send/recv)"
     )
 
-    # Debug log file for weight loading (bypasses all output redirection)
+    # Debug/timing log file for weight loading (bypasses all output redirection)
     _debug_log = open(f"/tmp/weight_loader_rank{rank}.log", "w")
+    _file_counter = [0]  # Use list for closure mutability
 
     def distributed_loader(file_path: str) -> Dict[str, Any]:
-        """Load weights via distributed broadcast."""
+        """Load weights via OOB-coordinated send/recv."""
+        t_file_start = time.perf_counter()
+        _file_counter[0] += 1
+        file_num = _file_counter[0]
+
         file_name = Path(file_path).name
-        _debug_log.write(f">>> {file_name}, needed={len(needed_files) if needed_files else 'None'}\n")
+
+        # SYNC CHECKPOINT: Use OOB barrier to verify all ranks are in sync.
+        # This is lighter weight than all_sum and doesn't require data transfer.
+        oob.barrier(f"file_{file_num}")
+
+        # Determine who needs this file
+        r0_needs = rank0_files is None or file_name in rank0_files
+        r1_needs = rank1_files is None or file_name in rank1_files
+        i_need = (rank == 0 and r0_needs) or (rank == 1 and r1_needs)
+
+        _debug_log.write(f"\n=== FILE {file_num}: {file_name} (barrier OK) ===\n")
+        _debug_log.write(f"rank0_needs={r0_needs}, rank1_needs={r1_needs}, i_need={i_need}\n")
         _debug_log.flush()
 
-        # Broadcast file bytes from rank 0 (ALL ranks must participate)
-        file_bytes = broadcast_file_bytes(file_path, group, chunk_size)
-        file_size_mb = len(file_bytes) / 1e6
+        # Transfer ID for this file (unique per file)
+        transfer_id = f"weight_file_{file_num}"
 
-        # For pipeline mode, discard files this rank doesn't need BEFORE parsing
-        if needed_files is not None:
-            if file_name not in needed_files:
-                _debug_log.write(f"DISCARD: {file_name} ({file_size_mb:.1f}MB)\n")
-                _debug_log.flush()
-                del file_bytes
-                mx.clear_cache()
-                return {}
-            else:
-                _debug_log.write(f"KEEP: {file_name} ({file_size_mb:.1f}MB)\n")
-                _debug_log.flush()
-        else:
-            _debug_log.write(f"WARNING: needed_files is None! Keeping {file_name}\n")
+        # Determine transfer pattern based on who needs the file:
+        # - Neither needs: skip entirely (both ranks)
+        # - Only rank 0 needs: rank 0 reads locally, rank 1 does nothing
+        # - Only rank 1 needs: rank 0 reads and sends, rank 1 receives
+        # - Both need: rank 0 reads locally and sends, rank 1 receives
+
+        if not r0_needs and not r1_needs:
+            # No rank needs this file - skip entirely (both ranks must agree)
+            _debug_log.write(f"  SKIP: {file_name} (no rank needs it)\n")
+            _debug_log.flush()
+            t_file_end = time.perf_counter()
+            _debug_log.write(f"  TOTAL: {1000*(t_file_end-t_file_start):.0f}ms (skipped)\n")
+            _debug_log.flush()
+            return {}
+
+        file_bytes = None
+
+        if rank == 0:
+            # Rank 0 always reads the file (it's the source)
+            file_bytes = Path(file_path).read_bytes()
+            _debug_log.write(f"  READ: {len(file_bytes)} bytes from {file_path}\n")
             _debug_log.flush()
 
-        # Parse safetensors from bytes
-        numpy_weights = safetensors.numpy.load(file_bytes)
+            if r1_needs:
+                # Send to rank 1 (OOB-coordinated: waits for receiver ready)
+                _debug_log.write(f"  SEND: to rank 1 via {transfer_id}\n")
+                _debug_log.flush()
+                oob_send_file_bytes(file_bytes, group, dst_rank=1, transfer_id=transfer_id,
+                                    chunk_size=chunk_size, log_file=_debug_log)
 
-        # Free raw bytes immediately - no longer needed after parsing
+            if not r0_needs:
+                # Rank 0 sent to rank 1 but doesn't need it itself
+                del file_bytes
+                _debug_log.write(f"  DISCARD: {file_name} (sent to rank 1, not needed locally)\n")
+                _debug_log.flush()
+                t_file_end = time.perf_counter()
+                _debug_log.write(f"  TOTAL: {1000*(t_file_end-t_file_start):.0f}ms (sent only)\n")
+                _debug_log.flush()
+                return {}
+        else:
+            # Rank 1 (or other workers)
+            if r1_needs:
+                # Receive from rank 0 (OOB-coordinated: signals ready first)
+                _debug_log.write(f"  RECV: from rank 0 via {transfer_id}\n")
+                _debug_log.flush()
+                file_bytes = oob_recv_file_bytes(group, src_rank=0, transfer_id=transfer_id,
+                                                  chunk_size=chunk_size, log_file=_debug_log)
+                _debug_log.write(f"  RECEIVED: {len(file_bytes)} bytes\n")
+                _debug_log.flush()
+            else:
+                # Rank 1 doesn't need this file
+                _debug_log.write(f"  SKIP: {file_name} (not needed by rank {rank})\n")
+                _debug_log.flush()
+                t_file_end = time.perf_counter()
+                _debug_log.write(f"  TOTAL: {1000*(t_file_end-t_file_start):.0f}ms (not needed)\n")
+                _debug_log.flush()
+                return {}
+
+        _debug_log.write(f"  KEEP: {file_name}\n")
+        _debug_log.flush()
+
+        # Parse if we have bytes
+        if file_bytes is None:
+            t_file_end = time.perf_counter()
+            _debug_log.write(f"  TOTAL: {1000*(t_file_end-t_file_start):.0f}ms (no data)\n")
+            _debug_log.flush()
+            return {}
+
+        file_size_mb = len(file_bytes) / 1e6
+        t_after_transfer = time.perf_counter()
+
+        # Parse safetensors from bytes directly to mx.array (handles BF16)
+        weights = parse_safetensors(file_bytes, log_file=_debug_log)
+
+        t_after_parse = time.perf_counter()
+
+        # Free raw bytes immediately
         del file_bytes
 
-        # Convert numpy arrays to mx.array
-        weights = {k: mx.array(v) for k, v in numpy_weights.items()}
-        del numpy_weights
+        t_file_end = time.perf_counter()
+
+        # Log timing summary
+        transfer_ms = 1000 * (t_after_transfer - t_file_start)
+        parse_ms = 1000 * (t_after_parse - t_after_transfer)
+        total_ms = 1000 * (t_file_end - t_file_start)
+        throughput = file_size_mb / (t_file_end - t_file_start) if (t_file_end - t_file_start) > 0 else 0
+
+        _debug_log.write(
+            f"  TOTAL: {total_ms:.0f}ms (transfer={transfer_ms:.0f}ms, parse={parse_ms:.0f}ms) "
+            f"@ {throughput:.0f}MB/s, {len(weights)} tensors\n"
+        )
+        _debug_log.flush()
 
         logger.debug(
-            f"{get_node_prefix(rank)} Loaded {file_name}: {len(weights)} tensors"
+            f"{get_node_prefix(rank)} Loaded {file_name}: {len(weights)} tensors in {total_ms:.0f}ms"
         )
 
         return weights
 
+    # Store file order on the loader function for retrieval by mlx_lm
+    distributed_loader.file_order = file_order
+
     return distributed_loader
+
+
+def get_weight_loader_file_list(weight_loader: Callable) -> Optional[list]:
+    """Get the file list from a distributed weight loader.
+
+    The file list is stored as an attribute on the loader function by
+    make_distributed_weight_loader. This allows mlx_lm to use the same
+    file order that was exchanged via the manifest.
+
+    Args:
+        weight_loader: The weight loader function
+
+    Returns:
+        List of weight file names, or None if not available
+    """
+    return getattr(weight_loader, "file_order", None)
 
 
 def validate_memory_for_streaming(
@@ -1015,16 +1653,33 @@ def validate_memory_for_streaming(
     This should be called before creating the distributed weight loader
     to fail early if any rank lacks sufficient memory.
 
+    Uses OOB-coordinated send/recv to broadcast model size information
+    from rank 0 to workers.
+
     Args:
         model_path: Path to model directory (rank 0 only)
         group: MLX distributed group
 
     Raises:
         MemoryError: If any rank has insufficient memory
+        RuntimeError: If OOB coordinator is not initialized
     """
-    rank = group.rank()
+    from .oob import get_oob
 
-    # Rank 0 reads manifest and broadcasts sizes
+    rank = group.rank()
+    world_size = group.size()
+    chunk_size = get_chunk_size()
+
+    # Get OOB coordinator for synchronization
+    oob = get_oob()
+    if oob is None:
+        raise RuntimeError(
+            "OOB coordinator not initialized. Call init_oob() before "
+            "validate_memory_for_streaming(). OOB is required for reliable "
+            "send/recv coordination over JACCL."
+        )
+
+    # Rank 0 reads manifest and sends sizes to workers
     if rank == 0:
         src_path = Path(model_path)
         if not src_path.exists():
@@ -1037,20 +1692,26 @@ def validate_memory_for_streaming(
         total_size = sum(size for _, size in weight_files)
         max_file_size = max(size for _, size in weight_files) if weight_files else 0
 
-        # Broadcast total size and max file size
-        sizes = mx.array([total_size, max_file_size], dtype=mx.int64)
         logger.info(
             f"{get_node_prefix(rank)} Model: {len(weight_files)} weight files, "
             f"total {total_size / 1e9:.1f}GB, max file {max_file_size / 1e9:.1f}GB"
         )
-    else:
-        sizes = mx.zeros((2,), dtype=mx.int64)
 
-    # Broadcast sizes to all ranks
-    sizes_result = mx.distributed.all_sum(sizes, group=group)
-    mx.eval(sizes_result)
-    total_size = int(sizes_result[0].item())
-    max_file_size = int(sizes_result[1].item())
+        # Send size info to each worker via OOB-coordinated send
+        sizes_json = json.dumps({"total_size": total_size, "max_file_size": max_file_size})
+        sizes_bytes = sizes_json.encode("utf-8")
+        for dst_rank in range(1, world_size):
+            transfer_id = f"memory_validation_to_rank{dst_rank}"
+            oob_send_file_bytes(sizes_bytes, group, dst_rank, transfer_id,
+                                chunk_size=chunk_size)
+    else:
+        # Workers receive size info via OOB-coordinated recv
+        transfer_id = f"memory_validation_to_rank{rank}"
+        sizes_bytes = oob_recv_file_bytes(group, src_rank=0, transfer_id=transfer_id,
+                                           chunk_size=chunk_size)
+        sizes_data = json.loads(sizes_bytes.decode("utf-8"))
+        total_size = sizes_data["total_size"]
+        max_file_size = sizes_data["max_file_size"]
 
     # Each rank checks their memory
     has_memory, available, required = check_memory_for_streaming(
@@ -1070,3 +1731,6 @@ def validate_memory_for_streaming(
             f"{get_node_prefix(rank)} Memory check OK: "
             f"{available / 1e9:.1f}GB available, need {required / 1e9:.1f}GB"
         )
+
+    # Barrier to ensure all ranks completed memory check before proceeding
+    oob.barrier("memory_validation")
