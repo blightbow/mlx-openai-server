@@ -207,6 +207,7 @@ def create_lifespan(config_args: MLXServerConfig):
                     message_converter=config_args.message_converter,
                     trust_remote_code=config_args.trust_remote_code,
                     chat_template_file=config_args.chat_template_file,
+                    chat_template_type=config_args.chat_template_type,
                     debug=config_args.debug,
                 )
             # Initialize queue

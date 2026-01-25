@@ -1,16 +1,19 @@
+import json
 import os
+import pkgutil
+from pathlib import Path
+from typing import List, Dict, Union, Generator, Any
+
 import mlx.core as mx
-from mlx_lm.utils import load
-from mlx_lm.generate import (
-    stream_generate
-)
+import mlx_lm.chat_templates
 from dataclasses import dataclass
-from mlx_lm.generate import GenerationResponse
-from outlines.processors import JSONLogitsProcessor
+from mlx_lm.generate import GenerationResponse, stream_generate
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_sampler, make_logits_processors
+from mlx_lm.utils import load
+from outlines.processors import JSONLogitsProcessor
+
 from ..utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
-from typing import List, Dict, Union, Generator, Any
 
 DEFAULT_TEMPERATURE = os.getenv("DEFAULT_TEMPERATURE", 0.7)
 DEFAULT_TOP_P = os.getenv("DEFAULT_TOP_P", 0.95)
@@ -43,17 +46,63 @@ class CompletionResponse:
     prompt_tokens: int = None
     generation_tokens: int = None
 
+def _detect_chat_template_type(model_path: str) -> str | None:
+    """Auto-detect chat_template_type from model's config.json model_type.
+
+    Checks if the model's model_type matches an available Python chat template
+    module in mlx_lm.chat_templates. This enables models like DeepSeek V3.2
+    (model_type: deepseek_v32) to automatically use their specialized encoders.
+
+    Args:
+        model_path: Path to the model directory.
+
+    Returns:
+        The chat_template_type string if a matching encoder exists, None otherwise.
+    """
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return None
+
+    try:
+        with open(config_path, "r") as f:
+            config = json.load(f)
+        model_type = config.get("model_type")
+        if not model_type:
+            return None
+
+        # Get available chat templates from mlx_lm
+        available_templates = {
+            name for _, name, _ in pkgutil.iter_modules(mlx_lm.chat_templates.__path__)
+        }
+
+        if model_type in available_templates:
+            return model_type
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    return None
+
+
 class MLX_LM:
     """
     A wrapper class for MLX Language Model that handles both streaming and non-streaming inference.
-    
+
     This class provides a unified interface for generating text responses from text prompts,
     supporting both streaming and non-streaming modes.
     """
 
-    def __init__(self, model_path: str, context_length: int | None = None, trust_remote_code: bool = False, chat_template_file: str = None):
+    def __init__(self, model_path: str, context_length: int | None = None, trust_remote_code: bool = False, chat_template_file: str = None, chat_template_type: str = None):
         try:
-            self.model, self.tokenizer = load(model_path, lazy=False, tokenizer_config = {"trust_remote_code": trust_remote_code})
+            tokenizer_config = {"trust_remote_code": trust_remote_code}
+
+            # Auto-detect chat_template_type from model_type if not specified
+            if not chat_template_type:
+                chat_template_type = _detect_chat_template_type(model_path)
+
+            if chat_template_type:
+                tokenizer_config["chat_template_type"] = chat_template_type
+
+            self.model, self.tokenizer = load(model_path, lazy=False, tokenizer_config=tokenizer_config)
             self.pad_token_id = self.tokenizer.pad_token_id
             self.bos_token = self.tokenizer.bos_token
             self.model_type = self.model.model_type

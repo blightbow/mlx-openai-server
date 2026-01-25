@@ -193,6 +193,12 @@ def cli():
     help="Path to a custom chat template file. Only works with language models (lm) and multimodal models.",
 )
 @click.option(
+    "--chat-template-type",
+    default=None,
+    type=str,
+    help="Python chat template module name from mlx-lm (e.g., 'deepseek_v32'). Auto-detected from model_type if not specified. Only works with language models (lm) and multimodal models.",
+)
+@click.option(
     "--debug",
     is_flag=True,
     help="Enable debug mode for language models. Only works with language models (lm) and multimodal models.",
@@ -220,6 +226,7 @@ def launch(
     message_converter,
     trust_remote_code,
     chat_template_file,
+    chat_template_type,
     debug,
 ) -> None:
     """Start the FastAPI/Uvicorn server with the supplied flags.
@@ -252,6 +259,7 @@ def launch(
         message_converter=message_converter,
         trust_remote_code=trust_remote_code,
         chat_template_file=chat_template_file,
+        chat_template_type=chat_template_type,
         debug=debug,
     )
 

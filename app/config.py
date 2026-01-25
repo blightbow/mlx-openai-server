@@ -43,6 +43,7 @@ class MLXServerConfig:
     message_converter: str | None = None
     trust_remote_code: bool = False
     chat_template_file: str | None = None
+    chat_template_type: str | None = None
     debug: bool = False
 
     # Used to capture raw CLI input before processing
