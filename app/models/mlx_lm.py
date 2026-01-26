@@ -1,3 +1,4 @@
+import inspect
 import json
 import os
 import pkgutil
@@ -123,9 +124,23 @@ class MLX_LM:
         return self.model_type
 
     def create_input_prompt(self, messages: List[Dict[str, str]], chat_template_kwargs: Dict[str, Any]) -> str:
+        # Filter kwargs to only those accepted by the template function
+        # This prevents TypeErrors from templates that don't accept arbitrary kwargs
+        template_func = getattr(self.tokenizer, "_chat_template", None)
+        if template_func is not None:
+            sig = inspect.signature(template_func)
+            accepts_var_keyword = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            if not accepts_var_keyword:
+                chat_template_kwargs = {
+                    k: v for k, v in chat_template_kwargs.items()
+                    if k in sig.parameters
+                }
+
         return self.tokenizer.apply_chat_template(
             messages,
-            tokenize = False,
+            tokenize=False,
             add_generation_prompt=True,
             **chat_template_kwargs,
         )

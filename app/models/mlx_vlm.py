@@ -1,3 +1,4 @@
+import inspect
 import os
 import torch
 import mlx.core as mx
@@ -83,6 +84,22 @@ class MLX_VLM:
         return make_prompt_cache(self.model.language_model, max_kv_size=self.context_length)
 
     def create_input_prompt(self, messages: List[Dict[str, str]], chat_template_kwargs: Dict[str, Any]) -> str:
+        # Filter kwargs to only those accepted by the template function
+        # This prevents TypeErrors from templates that don't accept arbitrary kwargs
+        # Check processor's tokenizer for custom chat template (VLM structure)
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        template_func = getattr(tokenizer, "_chat_template", None) if tokenizer else None
+        if template_func is not None:
+            sig = inspect.signature(template_func)
+            accepts_var_keyword = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            )
+            if not accepts_var_keyword:
+                chat_template_kwargs = {
+                    k: v for k, v in chat_template_kwargs.items()
+                    if k in sig.parameters
+                }
+
         return self.processor.apply_chat_template(
             messages,
             tokenize=False,
