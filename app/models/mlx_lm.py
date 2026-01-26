@@ -1,4 +1,3 @@
-import inspect
 import json
 import os
 import pkgutil
@@ -123,26 +122,23 @@ class MLX_LM:
     def get_model_type(self) -> str:
         return self.model_type
 
+    # Parameters used for server-side logic, not meant for chat template encoders
+    _SERVER_ONLY_KWARGS = {"enable_thinking", "reasoning_effort"}
+
     def create_input_prompt(self, messages: List[Dict[str, str]], chat_template_kwargs: Dict[str, Any]) -> str:
-        # Filter kwargs to only those accepted by the template function
-        # This prevents TypeErrors from templates that don't accept arbitrary kwargs
-        template_func = getattr(self.tokenizer, "_chat_template", None)
-        if template_func is not None:
-            sig = inspect.signature(template_func)
-            accepts_var_keyword = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )
-            if not accepts_var_keyword:
-                chat_template_kwargs = {
-                    k: v for k, v in chat_template_kwargs.items()
-                    if k in sig.parameters
-                }
+        # Filter out server-side parameters that templates may not accept
+        # Some templates (e.g., deepseek_v32) pass **kwargs to internal functions
+        # that don't accept arbitrary parameters, causing TypeErrors
+        filtered_kwargs = {
+            k: v for k, v in chat_template_kwargs.items()
+            if k not in self._SERVER_ONLY_KWARGS
+        }
 
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            **chat_template_kwargs,
+            **filtered_kwargs,
         )
 
     def encode_prompt(self, input_prompt: str) -> List[int]:

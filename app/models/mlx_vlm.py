@@ -1,4 +1,3 @@
-import inspect
 import os
 import torch
 import mlx.core as mx
@@ -83,28 +82,21 @@ class MLX_VLM:
     def create_prompt_cache(self) -> List[Any]:
         return make_prompt_cache(self.model.language_model, max_kv_size=self.context_length)
 
+    # Parameters used for server-side logic, not meant for chat template encoders
+    _SERVER_ONLY_KWARGS = {"enable_thinking", "reasoning_effort"}
+
     def create_input_prompt(self, messages: List[Dict[str, str]], chat_template_kwargs: Dict[str, Any]) -> str:
-        # Filter kwargs to only those accepted by the template function
-        # This prevents TypeErrors from templates that don't accept arbitrary kwargs
-        # Check processor's tokenizer for custom chat template (VLM structure)
-        tokenizer = getattr(self.processor, "tokenizer", None)
-        template_func = getattr(tokenizer, "_chat_template", None) if tokenizer else None
-        if template_func is not None:
-            sig = inspect.signature(template_func)
-            accepts_var_keyword = any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-            )
-            if not accepts_var_keyword:
-                chat_template_kwargs = {
-                    k: v for k, v in chat_template_kwargs.items()
-                    if k in sig.parameters
-                }
+        # Filter out server-side parameters that templates may not accept
+        filtered_kwargs = {
+            k: v for k, v in chat_template_kwargs.items()
+            if k not in self._SERVER_ONLY_KWARGS
+        }
 
         return self.processor.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            **chat_template_kwargs
+            **filtered_kwargs
         )
 
     def create_inputs(self, text: str, images: List[str] = None, videos: List[str] = None) -> Dict[str, Any]:
