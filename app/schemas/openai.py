@@ -225,8 +225,7 @@ class ChatCompletionRequestBase(OpenAIBaseModel):
     n: int | None = Field(1, description="Number of completions to generate.")
     response_format: dict[str, Any] | None = Field(None, description="Format for the response.")
     seed: int | None = Field(
-        default_factory=lambda: random.randint(0, 1_000_000),
-        description="Random seed for reproducibility.",
+        None, description="The seed to use for sampling.",
     )
     user: str | None = Field(None, description="User identifier.")
     repetition_penalty: float | None = Field(
@@ -533,7 +532,7 @@ class ImageGenerationError(OpenAIBaseModel):
 class ImageEditRequest(OpenAIBaseModel):
     """Request data for OpenAI-compatible image edit API."""
 
-    image: UploadFile = Field(..., description="The image to edit")
+    image: UploadFile | list[UploadFile] = Field(..., description="The image(s) to edit. Must be a file upload or a list of file uploads")
     prompt: str = Field(..., description="The prompt for the image edit")
     model: str | None = Field(
         default=Config.IMAGE_EDIT_MODEL, description="The model to use for image edit"

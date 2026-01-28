@@ -163,13 +163,15 @@ def create_lifespan(config_args: MLXServerConfig):
                     enable_auto_tool_choice=config_args.enable_auto_tool_choice,
                     tool_call_parser=config_args.tool_call_parser,
                     reasoning_parser=config_args.reasoning_parser,
+                    message_converter=config_args.message_converter,
                     trust_remote_code=config_args.trust_remote_code,
                     chat_template_file=config_args.chat_template_file,
+                    debug=config_args.debug,
                 )
             elif config_args.model_type == "image-generation":
-                if config_args.config_name not in ["flux-schnell", "flux-dev", "flux-krea-dev", "qwen-image", "z-image-turbo", "fibo"]:
+                if config_args.config_name not in ["flux-schnell", "flux-dev", "flux-krea-dev", "qwen-image", "z-image-turbo", "fibo", "flux2-klein-4b", "flux2-klein-9b"]:
                     raise ValueError(
-                        f"Invalid config name: {config_args.config_name}. Only flux-schnell, flux-dev, flux-krea-dev, qwen-image, z-image-turbo, and fibo are supported for image generation."
+                        f"Invalid config name: {config_args.config_name}. Only flux-schnell, flux-dev, flux-krea-dev, qwen-image, z-image-turbo, fibo, flux2-klein-4b, and flux2-klein-9b are supported for image generation."
                     )
                 handler = MLXFluxHandler(
                     model_path=model_identifier,
@@ -208,10 +210,12 @@ def create_lifespan(config_args: MLXServerConfig):
                     enable_auto_tool_choice=config_args.enable_auto_tool_choice,
                     tool_call_parser=config_args.tool_call_parser,
                     reasoning_parser=config_args.reasoning_parser,
+                    message_converter=config_args.message_converter,
                     trust_remote_code=config_args.trust_remote_code,
                     chat_template_file=config_args.chat_template_file,
                     distributed=config_args.distributed,
                     weight_loader=config_args.weight_loader,
+                    debug=config_args.debug,
                 )
             # Initialize queue
             await handler.initialize(

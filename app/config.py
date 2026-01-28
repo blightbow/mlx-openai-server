@@ -24,14 +24,14 @@ class MLXServerConfig:
 
     model_path: str
     model_type: str = "lm"
-    context_length: int = 32768
+    context_length: int | None = None
     port: int = 8000
     host: str = "0.0.0.0"
     max_concurrency: int = 1
     queue_timeout: int = 300
     queue_size: int = 100
     disable_auto_resize: bool = False
-    quantize: int = 8
+    quantize: int | None = None
     config_name: str | None = None
     lora_paths: list[str] | None = field(default=None, init=False)
     lora_scales: list[float] | None = field(default=None, init=False)
@@ -41,6 +41,7 @@ class MLXServerConfig:
     enable_auto_tool_choice: bool = False
     tool_call_parser: str | None = None
     reasoning_parser: str | None = None
+    message_converter: str | None = None
     trust_remote_code: bool = False
     chat_template_file: str | None = None
     distributed: str | None = None  # "tensor" or "pipeline", None for non-distributed
@@ -57,6 +58,7 @@ class MLXServerConfig:
     hostfile: str | None = None  # Path to mlx.launch format hostfile (JSON)
     rank: int | None = None  # Explicit rank (overrides MLX_RANK env var)
     jaccl_port: int = 32323  # JACCL coordinator port
+    debug: bool = False
 
     # Used to capture raw CLI input before processing
     lora_paths_str: str | None = None

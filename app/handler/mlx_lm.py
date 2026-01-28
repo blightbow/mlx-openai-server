@@ -7,11 +7,13 @@ from fastapi import HTTPException
 from loguru import logger
 from ..models.mlx_lm import MLX_LM
 from ..core.queue import RequestQueue
-from .parser import ParserFactory
 from ..utils.errors import create_error_response
+from ..parsers import ParserManager
+from ..message_converters import MessageConverterManager
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple
-from ..schemas.openai import ChatCompletionRequest, EmbeddingRequest, UsageInfo
-
+from ..schemas.openai import ChatCompletionRequest, UsageInfo, PromptTokenUsageInfo
+from ..utils.prompt_cache import LRUPromptCache
+from ..utils.debug_logging import log_debug_request, log_debug_stats, log_debug_raw_text_response, log_debug_prompt, make_prompt_progress_callback, log_debug_cache_stats
 
 class MLXLMHandler:
     """
@@ -22,22 +24,24 @@ class MLXLMHandler:
     def __init__(
         self,
         model_path: str,
-        context_length: int = 32768,
+        context_length: int | None = None,
         max_concurrency: int = 1,
         enable_auto_tool_choice: bool = False,
         tool_call_parser: str = None,
         reasoning_parser: str = None,
+        message_converter: str = None,
         trust_remote_code: bool = False,
         chat_template_file: str = None,
         distributed: str = None,
         weight_loader: Optional[Callable[[str], Dict[str, Any]]] = None,
+        debug: bool = False,
     ):
         """
         Initialize the handler with the specified model path.
 
         Args:
             model_path (str): Path to the model directory.
-            context_length (int): Maximum context length for the model.
+            context_length (int | None): Maximum context length for the model. If None, uses model default.
             max_concurrency (int): Maximum number of concurrent model inference tasks.
             enable_auto_tool_choice (bool): Enable automatic tool choice.
             tool_call_parser (str): Name of the tool call parser to use (qwen3, glm4_moe, harmony, minimax, ...)
@@ -61,106 +65,16 @@ class MLXLMHandler:
         
         # Store parser configuration
         self.enable_auto_tool_choice = enable_auto_tool_choice
-        self.tool_call_parser = tool_call_parser
-        self.reasoning_parser = reasoning_parser
-        
+        # Debug mode
+        self.debug = debug   
+        self.reasoning_parser_name = reasoning_parser
+        self.tool_parser_name = tool_call_parser
+        self.prompt_cache = LRUPromptCache()
+        self.message_converter = MessageConverterManager.create_converter(message_converter)
         # Initialize request queue for text tasks
         self.request_queue = RequestQueue(max_concurrency=max_concurrency)
 
-        # Initialize message converter for supported models
-        self.converter = ParserFactory.create_converter(self.model_type)
-
         logger.info(f"Initialized MLXHandler with model path: {model_path}")
-    
-    def _create_parsers(self) -> Tuple[Optional[Any], Optional[Any]]:
-        """
-        Create appropriate parsers based on model type and available tools.
-        Uses ParserFactory for centralized parser creation logic.
-
-        Returns:
-            Tuple of (thinking_parser, tool_parser)
-        """
-
-        return ParserFactory.create_parsers(
-            model_type=self.model_type,
-            manual_reasoning_parser=self.reasoning_parser,
-            manual_tool_parser=self.tool_call_parser,
-        )
-
-    def _count_tokens(self, text: str) -> int:
-        """
-        Count the number of tokens in a text string.
-
-        Args:
-            text: The text to count tokens for.
-
-        Returns:
-            int: The number of tokens.
-        """
-        if not text:
-            return 0
-        tokens = self.model.tokenizer.encode(text, add_special_tokens=False)
-        return len(tokens)
-
-    def _count_message_tokens(self, messages: List[Dict[str, str]], **kwargs) -> int:
-        """
-        Count the number of tokens in a list of messages after applying chat template.
-
-        Args:
-            messages: List of messages to count tokens for.
-            **kwargs: Additional arguments to pass to apply_chat_template.
-
-        Returns:
-            int: The number of prompt tokens.
-        """
-        try:
-            input_tokens = self.model.tokenizer.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                **kwargs
-            )
-            return len(input_tokens)
-        except Exception as e:
-            logger.warning(f"Failed to count message tokens: {str(e)}")
-            # Fallback: rough estimate
-            total_text = " ".join([msg.get("content", "") for msg in messages if isinstance(msg.get("content"), str)])
-            return self._count_tokens(total_text)
-
-    def _extract_model_metadata(self) -> Dict[str, Any]:
-        """
-        Extract metadata from the loaded MLX model.
-
-        Returns:
-            dict: Metadata about the model including context_length, backend, etc.
-        """
-        metadata = {
-            "backend": "mlx",
-            "modality": "text",
-        }
-
-        # Add context length
-        if hasattr(self.model, 'max_kv_size'):
-            metadata["context_length"] = self.model.max_kv_size
-
-        # Add vocab size if available
-        if hasattr(self.model.tokenizer, 'vocab_size'):
-            metadata["vocab_size"] = self.model.tokenizer.vocab_size
-
-        # Add model family/type if available
-        if hasattr(self.model, 'model_type') and self.model.model_type:
-            metadata["model_family"] = self.model.model_type
-
-        # Add dtype info if available from model config
-        if hasattr(self.model.model, 'dtype'):
-            metadata["dtype"] = str(self.model.model.dtype)
-
-        # Add load settings
-        metadata["load_settings"] = {
-            "model_path": self.model_path,
-            "model_type": "lm"
-        }
-
-        return metadata
 
     async def get_models(self) -> List[Dict[str, Any]]:
         """
@@ -171,8 +85,7 @@ class MLXLMHandler:
                 "id": self.model_path,
                 "object": "model",
                 "created": self.model_created,
-                "owned_by": "local",
-                "metadata": self._extract_model_metadata()
+                "owned_by": "local"
             }]
         except Exception as e:
             logger.error(f"Error getting models: {str(e)}")
@@ -194,6 +107,24 @@ class MLXLMHandler:
         await self.request_queue.start(self._process_request)
         logger.info("Initialized MLXHandler and started request queue")
 
+    def refine_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Refine the messages to be more suitable for the model.
+        """
+        refined_messages = []
+
+        if self.message_converter:
+            logger.info("Message converter is enabled, converting messages...")
+            messages = self.message_converter.convert_messages(messages)
+            logger.info("Messages converted successfully")
+        
+        logger.info("Filtering out None values from messages...")
+        for message in messages:
+            cleaned_message = {k: v for k, v in message.items() if v is not None}
+            refined_messages.append(cleaned_message)
+        logger.info("Messages filtered successfully")
+        return refined_messages
+
     async def generate_text_stream(self, request: ChatCompletionRequest) -> AsyncGenerator[str, None]:
         """
         Generate a streaming response for text-only chat completion requests.
@@ -210,88 +141,172 @@ class MLXLMHandler:
         try:
             chat_messages, model_params = await self._prepare_text_request(request)
 
-            # Count prompt tokens
+            refined_messages = self.refine_messages(chat_messages)
             chat_template_kwargs = model_params.get("chat_template_kwargs", {})
-            prompt_tokens = self._count_message_tokens(chat_messages, **chat_template_kwargs)
+
+            input_prompt = self.model.create_input_prompt(refined_messages, chat_template_kwargs)
+
+            if self.debug:
+                log_debug_prompt(input_prompt)
+
+            input_ids = self.model.encode_prompt(input_prompt)
+
+            cache, rest_input_ids = self.prompt_cache.fetch_nearest_cache(input_ids)
+
+            # Cache key must be the FULL input_ids, not rest_input_ids.
+            # Using rest_input_ids causes memory leaks: on "longer" cache hits,
+            # rest_input_ids is a suffix (e.g., [B] from input [A,B]), creating
+            # new cache entries [B,X,Y,Z] instead of updating [A,B,X,Y,Z].
+            # The original entry is never evicted and duplicates accumulate.
+            cache_key = input_ids[:]
+
+            if cache is None:
+                cache = self.model.create_prompt_cache()
+
+            total_input_tokens = len(input_ids)
+            total_remaining_tokens = len(rest_input_ids)
+            total_cached_tokens = total_input_tokens - total_remaining_tokens
+
+            if self.debug:
+                log_debug_cache_stats(total_input_tokens, total_remaining_tokens)
+
+                
+            enable_thinking = chat_template_kwargs.get("enable_thinking", True)
+
+            # Create parsers using ParserManager
+            parsers_result = ParserManager.create_parsers(
+                reasoning_parser_name=self.reasoning_parser_name,
+                tool_parser_name=self.tool_parser_name,
+            )
+
+            # Handle enable_thinking flag for separate reasoning parsers
+            if not enable_thinking and parsers_result.reasoning_parser:
+                if parsers_result.reasoning_parser.respects_enable_thinking():
+                    parsers_result.reasoning_parser = None
+
+            if model_params.get("schema"):
+                logger.info("JSON schema is enabled, disabling reasoning parser and tool parser")
+                parsers_result.reasoning_parser = None
+                parsers_result.tool_parser = None
+
+            prompt_progress_callback = make_prompt_progress_callback() if self.debug else None
 
             request_data = {
-                "messages": chat_messages,
+                "input_ids": rest_input_ids,
+                "prompt_cache": cache,
                 "stream": True,
+                "prompt_progress_callback": prompt_progress_callback,
                 **model_params
             }
-            response_generator, prompt_tokens = await self.request_queue.submit(request_id, request_data)
-            # Create appropriate parsers for this model type
+            
+            if self.debug:
+                log_debug_request(request_data)
+                request_data["verbose"] = True
 
-            thinking_parser, tool_parser = self._create_parsers()
+            response_generator = await self.request_queue.submit(request_id, request_data)
 
+            after_reasoning_close_content = None
+            final_chunk = None
             is_first_chunk = True
-            completion_chunks = []  # Accumulate completion for token counting
-            after_thinking_close_content = None
-
-            if thinking_parser and ParserFactory.has_special_parsing(self.reasoning_parser):
+            raw_text = "" # only use for debugging
+            
+            # Handle unified parser streaming
+            if parsers_result.is_unified:
+                unified_parser = parsers_result.unified_parser
                 for chunk in response_generator:
-                    if not chunk or not chunk.text:
+                    if chunk is None:
                         continue
+                    final_chunk = chunk
                     text = chunk.text
-                    completion_chunks.append(text)
-                    parsed_content, is_complete = thinking_parser.parse_stream(text)
-                    if parsed_content:
-                        yield parsed_content
-                    if is_complete:
-                        break
+                    raw_text += text
+                    cache_key.append(chunk.token)
+                    
+                    parsed_result, is_complete = unified_parser.parse_streaming(text)
+                    if parsed_result:
+                        # Unified parser returns dict with reasoning_content, tool_calls, content
+                        if parsed_result.get("reasoning_content"):
+                            yield {"reasoning_content": parsed_result["reasoning_content"]}
+                        if parsed_result.get("tool_calls"):
+                            for tool_call in parsed_result["tool_calls"]:
+                                yield tool_call
+                        if parsed_result.get("content"):
+                            yield parsed_result["content"]
+
+                if hasattr(unified_parser, "handle_parse_streaming_end"):
+                    parsed_result, is_complete = unified_parser.handle_parse_streaming_end()
+                    if parsed_result:
+                        # Unified parser returns dict with reasoning_content, tool_calls, content
+                        if parsed_result.get("reasoning_content"):
+                            yield {"reasoning_content": parsed_result["reasoning_content"]}
+                        if parsed_result.get("tool_calls"):
+                            for tool_call in parsed_result["tool_calls"]:
+                                yield tool_call
+                        if parsed_result.get("content"):
+                            yield parsed_result["content"]
             else:
-
-                if ParserFactory.respects_enable_thinking(self.reasoning_parser):
-                    enable_thinking = chat_template_kwargs.get("enable_thinking", True)
-                    if not enable_thinking:
-                        thinking_parser = None
-
-                # # Process streaming response
+                # Handle separate parsers streaming
+                reasoning_parser = parsers_result.reasoning_parser
+                tool_parser = parsers_result.tool_parser
+                
                 for chunk in response_generator:
-
-                    if not chunk or not chunk.text:
+                    if chunk is None:
                         continue
-
+                    final_chunk = chunk
                     text = chunk.text
-                    completion_chunks.append(text)
-
+                    raw_text += text
+                    cache_key.append(chunk.token)
                     if is_first_chunk:
-                        if thinking_parser and ParserFactory.needs_redacted_reasoning_prefix(self.reasoning_parser):
-                            text = thinking_parser.get_thinking_open() + text
+                        if reasoning_parser and hasattr(reasoning_parser, 'needs_redacted_reasoning_prefix'):
+                            if reasoning_parser.needs_redacted_reasoning_prefix():
+                                text = reasoning_parser.get_reasoning_open() + text
                         is_first_chunk = False
-
-                    if thinking_parser:
-                        parsed_content, is_complete = thinking_parser.parse_stream(text)
-                        after_thinking_close_content = None
+                    if reasoning_parser:
+                        parsed_content, is_complete = reasoning_parser.extract_reasoning_streaming(text)
                         if parsed_content:
-                            if isinstance(parsed_content, dict):
-                                after_thinking_close_content = parsed_content.pop("content", None)
+                            after_reasoning_close_content = parsed_content.get("after_reasoning_close_content")
                             yield parsed_content
                         if is_complete:
-                            thinking_parser = None
-                        if after_thinking_close_content:
-                            text = after_thinking_close_content
+                            reasoning_parser = None
+                        if after_reasoning_close_content:
+                            text = after_reasoning_close_content
+                            after_reasoning_close_content = None
                         else:
                             continue
-                        
                     if tool_parser:
-                        parsed_content, is_complete = tool_parser.parse_stream(text)
-                        if is_complete:
-                            yield parsed_content
+                        parsed_content, is_complete = tool_parser.extract_tool_calls_streaming(text)
+                        if parsed_content:
+                            content = parsed_content.get("content")
+                            if content:
+                                yield content
+                            tool_calls = parsed_content.get("tool_calls")
+                            if tool_calls:
+                                for tool_call in tool_calls:
+                                    yield tool_call
                         continue
-
+                    
                     yield text
 
-            # Count completion tokens and yield usage info at the end
-            completion_text = "".join(completion_chunks)
-            completion_tokens = self._count_tokens(completion_text)
-            total_tokens = prompt_tokens + completion_tokens
+            total_tokens = final_chunk.prompt_tokens + final_chunk.generation_tokens
+            self.prompt_cache.insert_cache(cache_key, cache)
+
+            if self.debug:
+                log_debug_raw_text_response(raw_text)
+                log_debug_stats(
+                    final_chunk.prompt_tokens,
+                    final_chunk.generation_tokens,
+                    total_tokens,
+                    final_chunk.generation_tps,
+                    final_chunk.peak_memory
+                )
 
             yield {
                 "__usage__": UsageInfo(
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=total_tokens
+                    prompt_tokens=final_chunk.prompt_tokens,
+                    completion_tokens=final_chunk.generation_tokens,
+                    total_tokens=total_tokens,
+                    prompt_tokens_details=PromptTokenUsageInfo(
+                        cached_tokens=total_cached_tokens
+                    )
                 )
             }
 
@@ -319,52 +334,69 @@ class MLXLMHandler:
 
         try:
             chat_messages, model_params = await self._prepare_text_request(request)
+            # Refine messages to remove None values and convert to the correct format
+            refined_messages = self.refine_messages(chat_messages)
 
             # Count prompt tokens
             chat_template_kwargs = model_params.get("chat_template_kwargs", {})
-            prompt_tokens = self._count_message_tokens(chat_messages, **chat_template_kwargs)
+
+            input_prompt = self.model.create_input_prompt(refined_messages, chat_template_kwargs)
+
+            if self.debug:
+                log_debug_prompt(input_prompt)
+
+            input_ids = self.model.encode_prompt(input_prompt)
+
+            cache, rest_input_ids = self.prompt_cache.fetch_nearest_cache(input_ids)
+
+            # Cache key must be the FULL input_ids, not rest_input_ids.
+            # See generate_text_stream for detailed explanation.
+            cache_key = input_ids[:]
+
+            if cache is None:
+                cache = self.model.create_prompt_cache()
+
+            total_input_tokens = len(input_ids)
+            total_remaining_tokens = len(rest_input_ids)
+            total_cached_tokens = total_input_tokens - total_remaining_tokens
+
+            if self.debug:
+                log_debug_cache_stats(total_input_tokens, total_remaining_tokens)
+            
+            prompt_progress_callback = make_prompt_progress_callback() if self.debug else None
 
             request_data = {
-                "messages": chat_messages,
+                "input_ids": rest_input_ids,
+                "prompt_cache": cache,
                 "stream": False,
+                "prompt_progress_callback": prompt_progress_callback,
                 **model_params
             }
-            response, prompt_tokens = await self.request_queue.submit(request_id, request_data)
 
-            # Count completion tokens
-            completion_tokens = self._count_tokens(response if isinstance(response, str) else response.get("content", ""))
-            total_tokens = prompt_tokens + completion_tokens
-
-            # Create usage info
-            usage = UsageInfo(
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens
+            response = await self.request_queue.submit(request_id, request_data)
+            
+            # Create parsers using ParserManager
+            parsers_result = ParserManager.create_parsers(
+                reasoning_parser_name=self.reasoning_parser_name,
+                tool_parser_name=self.tool_parser_name,
             )
-
-            # Create appropriate parsers for this model type
-            thinking_parser, tool_parser = self._create_parsers()
 
             enable_thinking = chat_template_kwargs.get("enable_thinking", True)
 
-            if ParserFactory.respects_enable_thinking(self.reasoning_parser):
-                if not enable_thinking:
-                    thinking_parser = None
+            # Handle enable_thinking flag for separate reasoning parsers
+            if not enable_thinking and parsers_result.reasoning_parser:
+                if parsers_result.reasoning_parser.respects_enable_thinking():
+                    parsers_result.reasoning_parser = None
 
-            if not thinking_parser and not tool_parser:
-                return {"response": response, "usage": usage}
+            if model_params.get("schema"):
+                logger.info("JSON schema is enabled, disabling reasoning parser and tool parser")
+                parsers_result.reasoning_parser = None
+                parsers_result.tool_parser = None
 
-            response_text = response
+            response_text = response.text
+            cache_key += response.tokens
 
-            if thinking_parser and ParserFactory.has_special_parsing(self.reasoning_parser):
-                # Handle parsers with special parsing logic (e.g., harmony returns dict)
-                parsed = thinking_parser.parse(response_text)
-                return {"response": parsed, "usage": usage}
-
-
-            if thinking_parser and ParserFactory.needs_redacted_reasoning_prefix(self.reasoning_parser):
-                # Add thinking tag to response for parsers that need it
-                response_text = thinking_parser.get_thinking_open() + response_text
+            self.prompt_cache.insert_cache(cache_key, cache)
 
             parsed_response = {
                 "reasoning_content": None,
@@ -372,14 +404,56 @@ class MLXLMHandler:
                 "content": None
             }
 
-            if thinking_parser:
-                thinking_response, response_text = thinking_parser.parse(response_text)
-                parsed_response["reasoning_content"] = thinking_response
+            # Handle unified parser
+            if parsers_result.is_unified:
+                unified_parser = parsers_result.unified_parser
+                parsed_result = unified_parser.parse(response_text)
+                if parsed_result:
+                    parsed_response["reasoning_content"] = parsed_result.get("reasoning_content")
+                    parsed_response["tool_calls"] = parsed_result.get("tool_calls")
+                    parsed_response["content"] = parsed_result.get("content")
+            # Handle separate parsers
+            elif parsers_result.reasoning_parser or parsers_result.tool_parser:
+                reasoning_parser = parsers_result.reasoning_parser
+                tool_parser = parsers_result.tool_parser
 
-            if tool_parser:
-                tool_response, response_text = tool_parser.parse(response_text)
-                parsed_response["tool_calls"] = tool_response
-            parsed_response["content"] = response_text
+                if reasoning_parser and reasoning_parser.needs_redacted_reasoning_prefix():
+                    response_text = reasoning_parser.get_reasoning_open() + response_text
+
+                if reasoning_parser:
+                    parsed_content = reasoning_parser.extract_reasoning(response_text)
+                    parsed_response["reasoning_content"] = parsed_content.get("reasoning_content")
+                    parsed_response["content"] = parsed_content.get("content")
+                    response_text = parsed_content.get("after_reasoning_close_content")
+
+                if response_text:
+                    if tool_parser:
+                        parsed_content = tool_parser.extract_tool_calls(response_text)
+                        parsed_response["tool_calls"] = parsed_content.get("tool_calls")
+                        parsed_response["content"] = parsed_content.get("content")
+            else:
+                parsed_response["content"] = response_text
+
+            total_tokens = response.prompt_tokens + response.generation_tokens
+
+            if self.debug:
+                log_debug_raw_text_response(response.text)
+                log_debug_stats(
+                    response.prompt_tokens,
+                    response.generation_tokens,
+                    total_tokens,
+                    response.generation_tps,
+                    response.peak_memory
+                )
+
+            usage = UsageInfo(
+                prompt_tokens=response.prompt_tokens,
+                completion_tokens=response.generation_tokens,
+                total_tokens=total_tokens,
+                prompt_tokens_details=PromptTokenUsageInfo(
+                    cached_tokens=total_cached_tokens
+                )
+            )
 
             return {"response": parsed_response, "usage": usage}
                         
@@ -390,37 +464,6 @@ class MLXLMHandler:
         except Exception as e:
             logger.error(f"Error in text response generation: {str(e)}")
             content = create_error_response(f"Failed to generate text response: {str(e)}", "server_error", HTTPStatus.INTERNAL_SERVER_ERROR)
-            raise HTTPException(status_code=500, detail=content)
-        
-    async def generate_embeddings_response(self, request: EmbeddingRequest):
-        """
-        Generate embeddings for a given text input.
-        
-        Args:
-            request: EmbeddingRequest object containing the text input.
-        
-        Returns:
-            List[float]: Embeddings for the input text.
-        """
-        try:
-            # Create a unique request ID
-            request_id = f"embeddings-{uuid.uuid4()}"
-            if isinstance(request.input, str):
-                request.input = [request.input]
-            request_data = {
-                "type": "embeddings",
-                "input": request.input,
-                "model": request.model
-            }
-
-            # Submit to the request queue
-            response = await self.request_queue.submit(request_id, request_data)
-
-            return response
-
-        except Exception as e:
-            logger.error(f"Error in embeddings generation: {str(e)}")
-            content = create_error_response(f"Failed to generate embeddings: {str(e)}", "server_error", HTTPStatus.INTERNAL_SERVER_ERROR)
             raise HTTPException(status_code=500, detail=content)
         
 
@@ -434,44 +477,22 @@ class MLXLMHandler:
         Returns:
             str: The model's response.
         """
-        try:
-            # Check if the request is for embeddings
-            if request_data.get("type") == "embeddings":
-                result = self.model.get_embeddings(request_data["input"])
-                # Force garbage collection after embeddings
-                gc.collect()
-                return result
-
-            # Extract request parameters
-            messages = request_data.get("messages", [])
-            stream = request_data.get("stream", False)
-            
-            # Remove these keys from model_params
-            model_params = request_data.copy()
-            model_params.pop("messages", None)
-            model_params.pop("stream", None)
-
-            # Apply message conversion if needed
-            if self.converter:
-                refined_messages = self.converter.convert_messages(messages)
-            else:
-                # Reformat messages for models without conversion needs
-                refined_messages = []
-                for message in messages:
-                    # Filter out None values
-                    cleaned_message = {k: v for k, v in message.items() if v is not None}
-                    refined_messages.append(cleaned_message)
+        try:            
+            input_ids = request_data.pop("input_ids")
+            prompt_cache = request_data.pop("prompt_cache")
+            stream = request_data.pop("stream")
 
             # Call the model
             response = self.model(
-                messages=refined_messages,
+                input_ids=input_ids,
+                prompt_cache=prompt_cache,
                 stream=stream,
-                **model_params
+                **request_data
             )            
             # Force garbage collection after model inference
             gc.collect()
             return response
-            
+
         except Exception as e:
             logger.error(f"Error processing text request: {str(e)}")
             # Clean up on error

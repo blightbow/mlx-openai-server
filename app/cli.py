@@ -12,7 +12,8 @@ import click
 from loguru import logger
 
 from .config import MLXServerConfig
-from .handler.parser.factory import PARSER_REGISTRY
+from .parsers import REASONING_PARSER_MAP, TOOL_PARSER_MAP, UNIFIED_PARSER_MAP
+from .message_converters import MESSAGE_CONVERTER_MAP
 from .main import start
 from .version import __version__
 
@@ -100,9 +101,9 @@ def cli():
 )
 @click.option(
     "--context-length",
-    default=32768,
+    default=None,
     type=int,
-    help="Context length for language models. Only works with `lm` or `multimodal` model types.",
+    help="Context length for language models. If not specified, uses model default. Only works with `lm` or `multimodal` model types.",
 )
 @click.option("--port", default=8000, type=int, help="Port to run the server on")
 @click.option("--host", default="0.0.0.0", help="Host to run the server on")
@@ -113,14 +114,14 @@ def cli():
 @click.option("--queue-size", default=100, type=int, help="Maximum queue size for pending requests")
 @click.option(
     "--quantize",
-    default=8,
+    default=None,
     type=int,
     help="Quantization level for the model. Only used for image-generation and image-edit Flux models.",
 )
 @click.option(
     "--config-name",
     default=None,
-    type=click.Choice(["flux-schnell", "flux-dev", "flux-krea-dev", "flux-kontext-dev", "qwen-image", "qwen-image-edit", "z-image-turbo", "fibo"]),
+    type=click.Choice(["flux-schnell", "flux-dev", "flux-krea-dev", "flux-kontext-dev", "qwen-image", "qwen-image-edit", "z-image-turbo", "fibo", "flux2-klein-4b", "flux2-klein-9b", "flux2-klein-edit-4b", "flux2-klein-edit-9b"]),
     help="Config name of the model. Only used for image-generation and image-edit models.",
 )
 @click.option(
@@ -165,14 +166,20 @@ def cli():
 @click.option(
     "--tool-call-parser",
     default=None,
-    type=click.Choice(list(PARSER_REGISTRY.keys())),
+    type=click.Choice(sorted(set(TOOL_PARSER_MAP.keys()) | set(UNIFIED_PARSER_MAP.keys()))),
     help="Specify tool call parser to use instead of auto-detection. Only works with language models.",
 )
 @click.option(
     "--reasoning-parser",
     default=None,
-    type=click.Choice(list(PARSER_REGISTRY.keys())),
+    type=click.Choice(sorted(set(REASONING_PARSER_MAP.keys()) | set(UNIFIED_PARSER_MAP.keys()))),
     help="Specify reasoning parser to use instead of auto-detection. Only works with language models.",
+)
+@click.option(
+    "--message-converter",
+    default=None,
+    type=click.Choice(sorted(MESSAGE_CONVERTER_MAP.keys())),
+    help="Specify message converter to use for preprocessing messages. Only works with language models.",
 )
 @click.option(
     "--trust-remote-code",
@@ -239,6 +246,11 @@ def cli():
     type=int,
     help="JACCL coordinator port. Default: 32323.",
 )
+@click.option(
+    "--debug",
+    is_flag=True,
+    help="Enable debug mode for language models. Only works with language models (lm) and multimodal models.",
+)
 def launch(
     model_path,
     model_type,
@@ -259,6 +271,7 @@ def launch(
     enable_auto_tool_choice,
     tool_call_parser,
     reasoning_parser,
+    message_converter,
     trust_remote_code,
     chat_template_file,
     distributed,
@@ -270,6 +283,7 @@ def launch(
     hostfile,
     rank,
     jaccl_port,
+    debug,
 ) -> None:
     """Start the FastAPI/Uvicorn server with the supplied flags.
 
@@ -298,6 +312,7 @@ def launch(
         enable_auto_tool_choice=enable_auto_tool_choice,
         tool_call_parser=tool_call_parser,
         reasoning_parser=reasoning_parser,
+        message_converter=message_converter,
         trust_remote_code=trust_remote_code,
         chat_template_file=chat_template_file,
         distributed=distributed,
@@ -309,6 +324,7 @@ def launch(
         hostfile=hostfile,
         rank=rank,
         jaccl_port=jaccl_port,
+        debug=debug,
     )
 
     asyncio.run(start(args))

@@ -6,8 +6,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Generator, List, Optional, Union
 
 import mlx.core as mx
+from dataclasses import dataclass
 from loguru import logger
-from mlx_lm.generate import generate, stream_generate
+from mlx_lm.generate import GenerationResponse, stream_generate
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 from mlx_lm.utils import load, load_config, load_tokenizer
@@ -23,6 +24,29 @@ DEFAULT_SEED = os.getenv("DEFAULT_SEED", 0)
 DEFAULT_MAX_TOKENS = os.getenv("DEFAULT_MAX_TOKENS", 8192)
 DEFAULT_BATCH_SIZE = os.getenv("DEFAULT_BATCH_SIZE", 32)
 
+@dataclass
+class CompletionResponse:
+    """
+    The output of :func:`__call__` when stream is False.
+
+    Args:
+        text (str): The next segment of decoded text. This can be an empty string.
+        tokens (List[int]): The list of tokens in the response.
+        peak_memory (float): The peak memory used so far in GB.
+        generation_tps (float): The tokens-per-second for generation.
+        generation_tokens (int): The number of generated tokens.
+        prompt_tps (float): The prompt processing tokens-per-second.
+        prompt_tokens (int): The number of tokens in the prompt.
+    """
+
+    text: str = None
+    tokens: List[int] = None
+    peak_memory: float = None
+    generation_tps: float = None
+    prompt_tps: float = None
+    prompt_tokens: int = None
+    generation_tokens: int = None
+
 class MLX_LM:
     """
     A wrapper class for MLX Language Model that handles both streaming and non-streaming inference.
@@ -37,7 +61,7 @@ class MLX_LM:
     def __init__(
         self,
         model_path: str,
-        context_length: int = 32768,
+        context_length: int | None = None,
         trust_remote_code: bool = False,
         chat_template_file: str = None,
         distributed: str = None,
@@ -64,7 +88,7 @@ class MLX_LM:
             self.pad_token_id = self.tokenizer.pad_token_id
             self.bos_token = self.tokenizer.bos_token
             self.model_type = self.model.model_type
-            self.max_kv_size = context_length
+            self.context_length = context_length
             self.outlines_tokenizer = OutlinesTransformerTokenizer(self.tokenizer)
             if chat_template_file:
                 if not os.path.exists(chat_template_file):
@@ -319,107 +343,68 @@ class MLX_LM:
         logger.info(f"[Rank {self.rank}] Model loaded and sharded successfully")
 
         return model, tokenizer
-        
+
     def _apply_pooling_strategy(self, embeddings: mx.array) -> mx.array:
         embeddings = mx.mean(embeddings, axis=1)
         return embeddings
-    
+
     def _apply_l2_normalization(self, embeddings: mx.array) -> mx.array:
         l2_norms = mx.linalg.norm(embeddings, axis=1, keepdims=True)
         embeddings = embeddings / (l2_norms +  1e-8)
         return embeddings
-    
+
     def _batch_process(self, prompts: List[str], batch_size: int = DEFAULT_BATCH_SIZE) -> List[List[int]]:
         """Process prompts in batches with optimized tokenization."""
         all_tokenized = []
-        
+
         # Process prompts in batches
         for i in range(0, len(prompts), batch_size):
             batch = prompts[i:i + batch_size]
             tokenized_batch = []
-            
+
             # Tokenize all prompts in batch
             for p in batch:
                 add_special_tokens = self.bos_token is None or not p.startswith(self.bos_token)
                 tokens = self.tokenizer.encode(p, add_special_tokens=add_special_tokens)
                 tokenized_batch.append(tokens)
-            
+
             # Find max length in batch
             max_length = max(len(tokens) for tokens in tokenized_batch)
-            
+
             # Pad tokens in a vectorized way
             for tokens in tokenized_batch:
                 padding = [self.pad_token_id] * (max_length - len(tokens))
                 all_tokenized.append(tokens + padding)
-        
+
         return all_tokenized
 
-    def _preprocess_prompt(self, prompt: str) -> List[int]:
-        """Tokenize a single prompt efficiently."""
-        add_special_tokens = self.bos_token is None or not prompt.startswith(self.bos_token)
-        tokens = self.tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
-        return mx.array(tokens)
-    
+    def create_prompt_cache(self) -> List[Any]:
+        return make_prompt_cache(self.model, max_kv_size=self.context_length)
+        
     def get_model_type(self) -> str:
         return self.model_type
-    
-    def get_embeddings(
-        self, 
-        prompts: List[str], 
-        batch_size: int = DEFAULT_BATCH_SIZE,
-        normalize: bool = True
-    ) -> List[float]:
-        """
-        Get embeddings for a list of prompts efficiently.
-        
-        Args:
-            prompts: List of text prompts
-            batch_size: Size of batches for processing
-            
-        Returns:
-            List of embeddings as float arrays
-        """
-        # Process in batches to optimize memory usage
-        all_embeddings = []
-        try:
-            for i in range(0, len(prompts), batch_size):
-                batch_prompts = prompts[i:i + batch_size]
-                tokenized_batch = self._batch_process(batch_prompts, batch_size)
-                
-                # Convert to MLX array for efficient computation
-                tokenized_batch = mx.array(tokenized_batch)
-                
-                try:
-                    # Compute embeddings for batch
-                    batch_embeddings = self.model.model(tokenized_batch)
-                    pooled_embedding = self._apply_pooling_strategy(batch_embeddings)
-                    if normalize:
-                        pooled_embedding = self._apply_l2_normalization(pooled_embedding)
-                    all_embeddings.extend(pooled_embedding.tolist())
-                finally:
-                    # Explicitly free MLX arrays to prevent memory leaks
-                    del tokenized_batch
-                    if 'batch_embeddings' in locals():
-                        del batch_embeddings
-                    if 'pooled_embedding' in locals():
-                        del pooled_embedding
-                    # Force MLX garbage collection
-                    mx.clear_cache()
-                    gc.collect()
-        except Exception as e:
-            # Clean up on error
-            mx.clear_cache()
-            gc.collect()
-            raise
 
-        return all_embeddings
-        
+    def create_input_prompt(self, messages: List[Dict[str, str]], chat_template_kwargs: Dict[str, Any]) -> str:
+        return self.tokenizer.apply_chat_template(
+            messages,
+            tokenize = False,
+            add_generation_prompt=True,
+            **chat_template_kwargs,
+        )
+
+    def encode_prompt(self, input_prompt: str) -> List[int]:
+        add_special_tokens = self.tokenizer.bos_token is None or not input_prompt.startswith(
+            self.tokenizer.bos_token
+        )
+        return self.tokenizer.encode(input_prompt, add_special_tokens=add_special_tokens)
+
     def __call__(
         self, 
-        messages: List[Dict[str, str]], 
+        input_ids: List[int],
+        prompt_cache: List[Any] = None,
         stream: bool = False, 
         **kwargs
-    ) -> Union[str, Generator[str, None, None]]:
+    ) -> Union[CompletionResponse, Generator[GenerationResponse, None, None]]:
         """
         Generate text response from the model.
 
@@ -433,9 +418,8 @@ class MLX_LM:
                 - max_tokens: Maximum number of tokens to generate (default: 256)
         """
         # Set default parameters if not provided
-        seed = kwargs.get("seed", DEFAULT_SEED)
+        seed = kwargs.get("seed")
         max_tokens = kwargs.get("max_tokens", DEFAULT_MAX_TOKENS)
-        chat_template_kwargs = kwargs.get("chat_template_kwargs", {})
 
         sampler_kwargs = {
             "temp": kwargs.get("temperature", DEFAULT_TEMPERATURE),
@@ -456,15 +440,13 @@ class MLX_LM:
                     tensor_library_name = "mlx"
                 )
             )
-        
-        mx.random.seed(seed)
-        prompt_cache = make_prompt_cache(self.model, self.max_kv_size)
 
-        input_tokens = self.tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            **chat_template_kwargs,
-        )
+        # Only seed RNG when an explicit non-negative seed is provided
+        # None or negative values (e.g., -1) result in non-deterministic generation
+        if seed is not None and seed >= 0:
+            mx.random.seed(seed)
+        
+        prompt_progress_callback = kwargs.get("prompt_progress_callback")
 
         # In distributed mode (coordinator/rank 0), broadcast tokens to workers
         # Workers are running the inference loop and waiting for these tokens
@@ -473,7 +455,7 @@ class MLX_LM:
 
             coordinator = DistributedCoordinator(self.group)
             coordinator.broadcast_request(
-                tokens=input_tokens,
+                tokens=input_ids,
                 max_tokens=max_tokens,
                 temperature=sampler_kwargs["temp"],
                 top_p=sampler_kwargs["top_p"],
@@ -483,30 +465,38 @@ class MLX_LM:
                 repetition_penalty=repetition_penalty,
                 repetition_context_size=repetition_context_size,
             )
-            logger.debug(f"[Rank 0] Broadcast {len(input_tokens)} tokens to workers")
+            logger.debug(f"[Rank 0] Broadcast {len(input_ids)} tokens to workers")
 
         sampler = make_sampler(**sampler_kwargs)
 
-        prompt_tokens = len(input_tokens)
+        stream_response = stream_generate(
+            self.model,
+            self.tokenizer,
+            input_ids,
+            sampler=sampler,
+            max_tokens=max_tokens,
+            prompt_cache=prompt_cache,
+            logits_processors=logits_processors,
+            prompt_progress_callback=prompt_progress_callback
+        )
+        if stream:
+            return stream_response
 
-        if not stream:
-            return generate(
-                self.model,
-                self.tokenizer,
-                input_tokens,
-                sampler=sampler,
-                max_tokens=max_tokens,
-                prompt_cache=prompt_cache,
-                logits_processors=logits_processors
-            ), prompt_tokens
-        else:
-            # Streaming mode: return generator of chunks
-            return stream_generate(
-                self.model,
-                self.tokenizer,
-                input_tokens,
-                sampler=sampler,
-                max_tokens=max_tokens,
-                prompt_cache=prompt_cache,
-                logits_processors=logits_processors
-            ), prompt_tokens
+        text = ""
+        tokens = []
+        final_chunk = None
+        for chunk in stream_response:
+            text += chunk.text
+            tokens.append(chunk.token)
+            if chunk.finish_reason:
+                final_chunk = chunk
+        
+        return CompletionResponse(
+            text=text,
+            tokens=tokens,
+            peak_memory=final_chunk.peak_memory,
+            generation_tps=final_chunk.generation_tps,
+            prompt_tps=final_chunk.prompt_tps,
+            prompt_tokens=final_chunk.prompt_tokens,
+            generation_tokens=final_chunk.generation_tokens,
+        )
