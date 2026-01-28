@@ -141,8 +141,8 @@ def setup_jaccl_env(
     # Set MLX_RANK
     os.environ["MLX_RANK"] = str(rank)
 
-    # Enable fast Metal synchronization for JACCL (requires macOS 15+/Metal 3.2+)
-    # Critical for low-latency communication since JACCL uses CPU-driven transfers
+    # Enable fast Metal synchronization for JACCL (macOS 15+/Metal 3.2+).
+    # Critical for low-latency RDMA - reduces CPU-GPU sync overhead.
     os.environ["MLX_METAL_FAST_SYNCH"] = "1"
 
     # Set MLX_JACCL_COORDINATOR

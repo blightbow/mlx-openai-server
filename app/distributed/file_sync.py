@@ -9,15 +9,31 @@ Key features:
 - Disk space validation before large transfers
 - Chunked transfers to stay within MPI limits
 - Backend-agnostic: works over JACCL/TB5 RDMA, ring/TCP, or MPI
-- OOB coordination: uses PyTorch TCPStore for receiver-initiated rendezvous
+
+JACCL Coordination Patterns
+===========================
+JACCL requires explicit coordination for send/recv due to timing asymmetry.
+This module uses both patterns depending on the transfer mode:
+
+1. **all_sum() broadcast pattern** (disk modes: full, sharded)
+   Rank 0 contributes data, workers contribute zeros → result = data.
+   All ranks participate synchronously - no additional coordination needed.
+   Used by: broadcast_manifest(), transfer_file(), broadcast_file_bytes()
+
+2. **OOB-coordinated send/recv** (memory mode)
+   Uses PyTorch TCPStore for receiver-initiated rendezvous (see oob.py).
+   Receiver signals ready → sender waits → safe to send.
+   Used by: oob_send_file_bytes(), oob_recv_file_bytes(), make_distributed_weight_loader()
+
+Ring and MPI backends don't need OOB coordination - Ring has implicit sync
+for neighbor operations, MPI has built-in rendezvous. See oob.py for details.
 
 Transfer modes:
-- Memory mode (--file-sync=memory): Uses OOB-coordinated send/recv for targeted
-  file transfers. Receiver signals ready via OOB, sender waits then sends.
-  Solves JACCL's timing asymmetry issues that cause SIGBUS with raw send/recv.
+- Memory mode (--file-sync=memory): OOB-coordinated send/recv for targeted
+  point-to-point transfers. Best for large models with pipeline parallelism.
 
-- Disk modes (--file-sync=full/sharded): Uses all_sum() broadcast pattern
-  for file transfers to disk. Rank 0 contributes data, workers contribute zeros.
+- Disk modes (--file-sync=full/sharded): all_sum() broadcast pattern.
+  All ranks receive all data (full) or participate in broadcast (sharded).
 """
 
 import hashlib
@@ -1136,10 +1152,9 @@ def send_file_bytes(
     file_bytes = data
     file_size = len(file_bytes)
 
-    # Send file size first
-    # CRITICAL: Must eval the RESULT of send(), not the input.
+    # Send file size first.
+    # IMPORTANT: Eval the RESULT of send(), not the input array.
     # send() returns a dependency-tracked array; eval triggers the actual send.
-    # See Issue #1849: "send is an operation in the graph... must be evaluated"
     size_array = mx.array([file_size], dtype=mx.int64)
     sent_size = mx.distributed.send(size_array, dst_rank, group=group)
     mx.eval(sent_size)
@@ -1170,7 +1185,7 @@ def send_file_bytes(
             padded_buffer[this_chunk_size:] = 0
 
         chunk = mx.array(padded_buffer)
-        # CRITICAL: Eval the send result, not the input chunk
+        # Eval the send result to trigger the actual send
         sent = mx.distributed.send(chunk, dst_rank, group=group)
         mx.eval(sent)
 
@@ -1285,10 +1300,10 @@ def oob_send_file_bytes(
 ) -> None:
     """Send bytes with OOB receiver-initiated rendezvous.
 
-    This implements the safe pattern for JACCL:
-    1. Wait for receiver to signal ready (via OOB)
+    Implements the safe JACCL send pattern (see oob.py):
+    1. Wait for receiver to signal ready (via TCPStore)
     2. Send data chunks (receiver has already posted recv)
-    3. Signal completion (via OOB)
+    3. Signal completion
 
     Args:
         data: Bytes to send
@@ -1326,10 +1341,10 @@ def oob_recv_file_bytes(
 ) -> bytearray:
     """Receive bytes with OOB receiver-initiated rendezvous.
 
-    This implements the safe pattern for JACCL:
-    1. Signal ready (via OOB) - tells sender we've posted recv
+    Implements the safe JACCL recv pattern (see oob.py):
+    1. Signal ready (via TCPStore) - tells sender we've posted recv
     2. Receive data chunks
-    3. Wait for sender's completion signal (via OOB)
+    3. Wait for sender's completion signal
 
     Args:
         group: MLX distributed group
@@ -1369,10 +1384,14 @@ def make_distributed_weight_loader(
 ) -> Callable[[str], Dict[str, Any]]:
     """Create a weight loader using OOB-coordinated send/recv for JACCL transfers.
 
-    This loader is designed to be passed to mlx_lm's load() function via the
-    weight_loader parameter. Uses OOB (out-of-band) coordination via PyTorch
-    TCPStore to implement receiver-initiated rendezvous, solving JACCL's timing
-    asymmetry issues that cause SIGBUS with raw send/recv.
+    This loader implements point-to-point weight file transfers using the
+    OOB (out-of-band) coordination layer. See oob.py for the full API.
+
+    The OOB pattern (receiver-initiated rendezvous) solves JACCL's timing
+    asymmetry issues that cause SIGBUS with raw send/recv:
+    1. Receiver signals ready via TCPStore
+    2. Sender waits for ready signal
+    3. Safe to send - receiver has posted recv
 
     For pipeline parallelism, only sends files to ranks that need them.
     For tensor parallelism, broadcasts all files to all ranks.
@@ -1405,8 +1424,7 @@ def make_distributed_weight_loader(
     if oob is None:
         raise RuntimeError(
             "OOB coordinator not initialized. Call init_oob() before "
-            "make_distributed_weight_loader(). OOB is required for reliable "
-            "send/recv coordination over JACCL."
+            "make_distributed_weight_loader(). See oob.py for details."
         )
 
     # For pipeline parallelism, compute which files each rank needs
@@ -1507,8 +1525,8 @@ def make_distributed_weight_loader(
 
         file_name = Path(file_path).name
 
-        # SYNC CHECKPOINT: Use OOB barrier to verify all ranks are in sync.
-        # This is lighter weight than all_sum and doesn't require data transfer.
+        # OOB barrier: verify all ranks are in sync before each file transfer.
+        # Lighter than all_sum - uses TCPStore key exchange, no data transfer.
         oob.barrier(f"file_{file_num}")
 
         # Determine who needs this file
@@ -1675,8 +1693,7 @@ def validate_memory_for_streaming(
     if oob is None:
         raise RuntimeError(
             "OOB coordinator not initialized. Call init_oob() before "
-            "validate_memory_for_streaming(). OOB is required for reliable "
-            "send/recv coordination over JACCL."
+            "validate_memory_for_streaming(). See oob.py for details."
         )
 
     # Rank 0 reads manifest and sends sizes to workers

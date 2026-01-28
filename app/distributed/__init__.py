@@ -3,7 +3,27 @@
 This module implements the coordination protocol for multi-rank
 inference over mlx.launch backends (JACCL, ring, or MPI). The
 coordinator (rank 0) serves HTTP and broadcasts tokens to workers.
-Workers participate in forward passes via mx.distributed.all_sum().
+Workers participate in forward passes via mx.distributed operations.
+
+JACCL Coordination Patterns
+===========================
+JACCL (Thunderbolt 5 RDMA) lacks MPI's built-in rendezvous protocol,
+which causes SIGBUS crashes when send/recv have asymmetric timing.
+We use two patterns to handle this:
+
+1. **all_sum() broadcast pattern** (coordinator.py)
+   For synchronous operations where all ranks participate together.
+   Rank 0 contributes data, workers contribute zeros → result = data.
+   Used for: token broadcast, parameter sync, synchronous file transfers.
+
+2. **OOB-coordinated send/recv** (oob.py, file_sync.py)
+   For point-to-point transfers with asymmetric timing.
+   Uses PyTorch TCPStore for receiver-initiated rendezvous.
+   Used for: memory-mode weight streaming, targeted file transfers.
+
+See oob.py docstring for full details on the OOB coordination layer.
+Ring backend doesn't need OOB (neighbor-only, implicit sync).
+MPI has built-in rendezvous and doesn't need OOB.
 
 Also provides distributed file synchronization for transferring
 model files to worker ranks before inference begins.

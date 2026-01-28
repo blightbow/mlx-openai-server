@@ -141,8 +141,7 @@ async def start(config: MLXServerConfig) -> None:
                 setup_jaccl_env(hosts, explicit_rank, config.jaccl_port)
 
                 # Initialize OOB BEFORE distributed init when using JACCL backend.
-                # OOB provides: 1) Startup gate (workers wait for rank 0)
-                #               2) Rendezvous for send/recv during weight streaming
+                # OOB provides startup gate and rendezvous for send/recv. See oob.py.
                 # Only JACCL needs OOB - Ring has implicit sync, MPI has built-in rendezvous.
                 backend = config.backend or detect_backend()
                 if backend == "jaccl":
@@ -165,9 +164,9 @@ async def start(config: MLXServerConfig) -> None:
             rank = group.rank()
             world_size = group.size()
 
-            # Initialize OOB for mlx.launch mode (after distributed init, since
-            # mlx.launch handles startup ordering). Skip if already initialized via hostfile.
+            # Initialize OOB for mlx.launch mode. Skip if already initialized via hostfile.
             # Only JACCL needs OOB - Ring has implicit sync, MPI has built-in rendezvous.
+            # See oob.py for details on the OOB coordination layer.
             if not config.hostfile:
                 backend = config.backend or detect_backend()
                 if backend == "jaccl":

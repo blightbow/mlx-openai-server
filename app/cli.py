@@ -220,13 +220,13 @@ def cli():
     "--oob-host",
     default=None,
     type=str,
-    help="Coordinator IP/hostname for JACCL OOB rendezvous (PyTorch TCPStore). Only used when --backend=jaccl. Falls back to MLX_OOB_HOST env var.",
+    help="Coordinator IP/hostname for OOB rendezvous (see oob.py). Only used for JACCL backend. Falls back to MLX_OOB_HOST env var.",
 )
 @click.option(
     "--oob-port",
     default=29400,
     type=int,
-    help="TCP port for JACCL OOB rendezvous. Default: 29400.",
+    help="TCP port for OOB TCPStore (see oob.py). Default: 29400.",
 )
 @click.option(
     "--hostfile",
