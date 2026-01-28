@@ -15,15 +15,16 @@ JACCL Coordination Patterns
 JACCL requires explicit coordination for send/recv due to timing asymmetry.
 This module uses both patterns depending on the transfer mode:
 
-1. **all_sum() broadcast pattern** (disk modes: full, sharded)
+1. **all_sum() broadcast pattern** (full disk mode)
    Rank 0 contributes data, workers contribute zeros → result = data.
    All ranks participate synchronously - no additional coordination needed.
    Used by: broadcast_manifest(), transfer_file(), broadcast_file_bytes()
 
-2. **OOB-coordinated send/recv** (memory mode)
+2. **OOB-coordinated send/recv** (memory mode, sharded disk mode)
    Uses PyTorch TCPStore for receiver-initiated rendezvous (see oob.py).
    Receiver signals ready → sender waits → safe to send.
-   Used by: oob_send_file_bytes(), oob_recv_file_bytes(), make_distributed_weight_loader()
+   Used by: oob_send_file_bytes(), oob_recv_file_bytes(),
+            make_distributed_weight_loader(), transfer_files_targeted()
 
 Ring and MPI backends don't need OOB coordination - Ring has implicit sync
 for neighbor operations, MPI has built-in rendezvous. See oob.py for details.
@@ -32,8 +33,13 @@ Transfer modes:
 - Memory mode (--file-sync=memory): OOB-coordinated send/recv for targeted
   point-to-point transfers. Best for large models with pipeline parallelism.
 
-- Disk modes (--file-sync=full/sharded): all_sum() broadcast pattern.
-  All ranks receive all data (full) or participate in broadcast (sharded).
+- Sharded disk mode (--file-sync=sharded): OOB-coordinated send/recv for
+  targeted disk transfers. Each rank only receives files it needs.
+  Optimal for pipeline parallelism where different ranks need different files.
+
+- Full disk mode (--file-sync=full): all_sum() broadcast pattern.
+  All ranks receive all files. Optimal for tensor parallelism where
+  all ranks need all weights.
 """
 
 import hashlib
@@ -670,6 +676,192 @@ def compute_pipeline_files(
     return needed_files
 
 
+def compute_all_rank_files(
+    index_path: Path,
+    config_path: Path,
+    world_size: int,
+) -> dict[int, set[str]]:
+    """Compute which weight files each rank needs for pipeline parallelism.
+
+    Called by rank 0 to determine the full transfer schedule.
+
+    Args:
+        index_path: Path to model.safetensors.index.json
+        config_path: Path to config.json
+        world_size: Number of ranks
+
+    Returns:
+        Dictionary mapping rank -> set of filenames needed by that rank.
+        Returns None if sharding cannot be determined.
+    """
+    rank_files = {}
+    for rank in range(world_size):
+        files = compute_pipeline_files(index_path, config_path, rank, world_size)
+        if files is None:
+            return None
+        rank_files[rank] = files
+    return rank_files
+
+
+def broadcast_rank_assignments(
+    rank_files: Optional[dict[int, set[str]]],
+    group: mx.distributed.Group,
+) -> dict[str, set[int]]:
+    """Broadcast file-to-rank assignments from rank 0 to all workers.
+
+    Converts rank->files mapping to file->ranks mapping and broadcasts via all_sum.
+
+    Args:
+        rank_files: Dictionary from compute_all_rank_files() (rank 0 only)
+        group: MLX distributed group
+
+    Returns:
+        Dictionary mapping filename -> set of ranks that need it
+    """
+    rank = group.rank()
+    world_size = group.size()
+
+    # Rank 0 serializes and broadcasts the assignments
+    if rank == 0:
+        # Convert rank->files to file->ranks for easier lookup during transfer
+        file_to_ranks: dict[str, set[int]] = {}
+        if rank_files:
+            for r, files in rank_files.items():
+                for f in files:
+                    if f not in file_to_ranks:
+                        file_to_ranks[f] = set()
+                    file_to_ranks[f].add(r)
+
+        # Serialize to JSON (convert sets to lists for JSON)
+        assignments_json = json.dumps({
+            f: list(ranks) for f, ranks in file_to_ranks.items()
+        })
+        assignments_bytes = assignments_json.encode("utf-8")
+        size_array = mx.array([len(assignments_bytes)], dtype=mx.int64)
+    else:
+        size_array = mx.zeros((1,), dtype=mx.int64)
+
+    # Broadcast size
+    size_result = mx.distributed.all_sum(size_array, group=group)
+    mx.eval(size_result)
+    data_size = int(size_result[0].item())
+
+    if data_size == 0:
+        return {}
+
+    # Broadcast data (pad to fixed size for all_sum)
+    if rank == 0:
+        padded = np.zeros(data_size, dtype=np.uint8)
+        padded[:len(assignments_bytes)] = list(assignments_bytes)
+        data_array = mx.array(padded)
+    else:
+        data_array = mx.zeros((data_size,), dtype=mx.uint8)
+
+    data_result = mx.distributed.all_sum(data_array, group=group)
+    mx.eval(data_result)
+
+    # Deserialize
+    data_bytes = np.array(data_result, copy=False).tobytes()
+    assignments_json = data_bytes.decode("utf-8")
+    raw_assignments = json.loads(assignments_json)
+
+    # Convert lists back to sets
+    return {f: set(ranks) for f, ranks in raw_assignments.items()}
+
+
+def transfer_files_targeted(
+    src_path: Optional[Path],
+    dst_path: Path,
+    weight_files: list[tuple[str, int]],
+    file_assignments: dict[str, set[int]],
+    group: mx.distributed.Group,
+    chunk_size: int,
+) -> int:
+    """Transfer weight files to specific ranks using OOB-coordinated send/recv.
+
+    Unlike transfer_file() which broadcasts to all ranks via all_sum, this
+    function only sends each file to the ranks that need it. This is optimal
+    for pipeline parallelism where different ranks need different files.
+
+    Requires OOB coordinator to be initialized (see oob.py).
+
+    Args:
+        src_path: Source directory (rank 0 only)
+        dst_path: Destination directory
+        weight_files: List of (filename, size) tuples to transfer
+        file_assignments: Dict mapping filename -> set of ranks that need it
+        group: MLX distributed group
+        chunk_size: Size of each transfer chunk
+
+    Returns:
+        Total bytes transferred to this rank
+    """
+    from .oob import get_oob
+
+    oob = get_oob()
+    if oob is None:
+        raise RuntimeError(
+            "OOB coordinator not initialized. Sharded disk mode requires OOB. "
+            "See oob.py for details."
+        )
+
+    rank = group.rank()
+    bytes_received = 0
+
+    # Process files in deterministic order (all ranks use same order)
+    for filename, file_size in sorted(weight_files):
+        needed_by = file_assignments.get(filename, set())
+
+        if not needed_by:
+            # No rank needs this file, skip
+            continue
+
+        transfer_base_id = f"sharded_disk_{filename}"
+
+        if rank == 0:
+            # Rank 0 reads the file
+            file_bytes = (src_path / filename).read_bytes()
+
+            # Write locally if rank 0 needs it
+            if 0 in needed_by:
+                file_dst = dst_path / filename
+                file_dst.parent.mkdir(parents=True, exist_ok=True)
+                file_dst.write_bytes(file_bytes)
+                bytes_received += len(file_bytes)
+                logger.debug(f"{get_node_prefix(rank)} Wrote {filename} locally")
+
+            # Send to workers that need it (in sorted order for determinism)
+            for dst_rank in sorted(needed_by - {0}):
+                transfer_id = f"{transfer_base_id}_to_{dst_rank}"
+                logger.debug(
+                    f"{get_node_prefix(rank)} Sending {filename} to rank {dst_rank}"
+                )
+                oob_send_file_bytes(
+                    file_bytes, group, dst_rank, transfer_id, chunk_size
+                )
+        else:
+            # Workers receive if they need this file
+            if rank in needed_by:
+                transfer_id = f"{transfer_base_id}_to_{rank}"
+                logger.debug(
+                    f"{get_node_prefix(rank)} Receiving {filename} from rank 0"
+                )
+                file_bytes = oob_recv_file_bytes(
+                    group, src_rank=0, transfer_id=transfer_id, chunk_size=chunk_size
+                )
+
+                # Write to disk
+                file_dst = dst_path / filename
+                file_dst.parent.mkdir(parents=True, exist_ok=True)
+                file_dst.write_bytes(file_bytes)
+                bytes_received += len(file_bytes)
+                logger.debug(
+                    f"{get_node_prefix(rank)} Wrote {filename} ({len(file_bytes)} bytes)"
+                )
+
+    return bytes_received
+
+
 def resolve_worker_path(model_path: str, worker_model_path: Optional[str]) -> Path:
     """Resolve the model path for worker ranks.
 
@@ -798,90 +990,124 @@ def sync_model_to_workers(
         file_dst = dst_path / filename
         transfer_file(file_src, file_dst, file_size, group, chunk_size)
 
-    # Phase 2: Determine which weight files this rank needs
+    # Phase 2: Transfer weight files
+    # Different strategies for sharded vs full mode:
+    # - sharded: OOB-coordinated send/recv (only transfers files to ranks that need them)
+    # - full: all_sum broadcast (all ranks receive all files)
+    metadata_size = sum(fsize for _, fsize in metadata_files)
+
     if mode == "sharded":
-        # Try to compute needed files for pipeline parallelism
+        # Sharded mode uses OOB-coordinated send/recv for targeted transfers.
+        # This is optimal for pipeline parallelism where different ranks need
+        # different files. See transfer_files_targeted() for details.
         index_path = dst_path / "model.safetensors.index.json"
         config_path = dst_path / "config.json"
 
-        needed_file_names = compute_pipeline_files(index_path, config_path, rank, size)
-
-        if needed_file_names is not None:
-            # Filter weight files to only those needed by this rank
-            weight_files_to_transfer = [
-                (name, fsize) for name, fsize in weight_files
-                if name in needed_file_names
-            ]
-            logger.info(
-                f"{get_node_prefix(rank)} Sharded mode: need {len(weight_files_to_transfer)} "
-                f"of {len(weight_files)} weight files"
-            )
+        # Rank 0 computes file assignments for ALL ranks
+        if rank == 0:
+            rank_files = compute_all_rank_files(index_path, config_path, size)
+            if rank_files is None:
+                logger.warning(
+                    f"{get_node_prefix(rank)} Cannot determine pipeline sharding, "
+                    f"falling back to full transfer"
+                )
         else:
-            # Fallback to full transfer if we can't determine needed files
+            rank_files = None
+
+        # Broadcast assignments to all ranks (small data, uses all_sum)
+        file_assignments = broadcast_rank_assignments(rank_files, group)
+
+        if not file_assignments:
+            # Fallback to full mode if sharding couldn't be determined
             logger.warning(
-                f"{get_node_prefix(rank)} Cannot determine pipeline sharding, "
-                f"falling back to full transfer"
+                f"{get_node_prefix(rank)} Sharded mode fallback: using full transfer"
             )
-            weight_files_to_transfer = weight_files
-    else:
-        # Full mode: transfer all weight files
+            mode = "full"  # Fall through to full mode below
+        else:
+            # Calculate which files this rank needs (for disk space check)
+            my_files = [
+                (name, fsize) for name, fsize in weight_files
+                if rank in file_assignments.get(name, set())
+            ]
+            weight_size = sum(fsize for _, fsize in my_files)
+            required_size = metadata_size + weight_size
+
+            # Check disk space before transfer
+            if rank != 0:
+                has_space, free_bytes = check_disk_space(dst_path, required_size)
+                if not has_space:
+                    buffer_multiplier = 1 + DISK_SPACE_BUFFER_PERCENT * 0.01
+                    buffered_size = required_size * buffer_multiplier
+                    raise DiskSpaceError(
+                        f"{get_node_prefix(rank)} Insufficient disk space: "
+                        f"need {buffered_size / 1e9:.1f}GB (inc. {DISK_SPACE_BUFFER_PERCENT}% buffer), "
+                        f"only {free_bytes / 1e9:.1f}GB available at {dst_path.parent}"
+                    )
+                logger.info(
+                    f"{get_node_prefix(rank)} Disk check OK: "
+                    f"{free_bytes / 1e9:.1f}GB free, need {required_size / 1e9:.1f}GB"
+                )
+
+            logger.info(
+                f"{get_node_prefix(rank)} Phase 2: Sharded transfer - "
+                f"this rank needs {len(my_files)} of {len(weight_files)} weight files "
+                f"({weight_size / 1e9:.2f}GB)"
+            )
+
+            # Transfer using OOB-coordinated send/recv
+            bytes_transferred = transfer_files_targeted(
+                src_path, dst_path, weight_files, file_assignments, group, chunk_size
+            )
+
+            total_transferred = metadata_size + bytes_transferred
+            logger.info(
+                f"{get_node_prefix(rank)} Model sync complete: "
+                f"{len(metadata_files)} metadata + {len(my_files)} weight files, "
+                f"{total_transferred / 1e9:.2f}GB"
+            )
+
+    # Full mode: transfer all weight files to all ranks via all_sum broadcast
+    if mode == "full":
         weight_files_to_transfer = weight_files
+        weight_size = sum(fsize for _, fsize in weight_files_to_transfer)
+        required_size = metadata_size + weight_size
 
-    # Calculate required disk space for this rank's files
-    metadata_size = sum(fsize for _, fsize in metadata_files)
-    weight_size = sum(fsize for _, fsize in weight_files_to_transfer)
-    required_size = metadata_size + weight_size
-
-    # Check disk space on workers before large transfers
-    if rank != 0:
-        has_space, free_bytes = check_disk_space(dst_path, required_size)
-        if not has_space:
-            buffer_multiplier = 1 + DISK_SPACE_BUFFER_PERCENT * 0.01
-            buffered_size = required_size * buffer_multiplier
-            raise DiskSpaceError(
-                f"{get_node_prefix(rank)} Insufficient disk space: "
-                f"need {buffered_size / 1e9:.1f}GB (inc. {DISK_SPACE_BUFFER_PERCENT}% buffer), "
-                f"only {free_bytes / 1e9:.1f}GB available at {dst_path.parent}"
+        # Check disk space on workers before large transfers
+        if rank != 0:
+            has_space, free_bytes = check_disk_space(dst_path, required_size)
+            if not has_space:
+                buffer_multiplier = 1 + DISK_SPACE_BUFFER_PERCENT * 0.01
+                buffered_size = required_size * buffer_multiplier
+                raise DiskSpaceError(
+                    f"{get_node_prefix(rank)} Insufficient disk space: "
+                    f"need {buffered_size / 1e9:.1f}GB (inc. {DISK_SPACE_BUFFER_PERCENT}% buffer), "
+                    f"only {free_bytes / 1e9:.1f}GB available at {dst_path.parent}"
+                )
+            logger.info(
+                f"{get_node_prefix(rank)} Disk check OK: "
+                f"{free_bytes / 1e9:.1f}GB free, need {required_size / 1e9:.1f}GB"
             )
+
         logger.info(
-            f"{get_node_prefix(rank)} Disk check OK: "
-            f"{free_bytes / 1e9:.1f}GB free, need {required_size / 1e9:.1f}GB"
+            f"{get_node_prefix(rank)} Phase 2: Full transfer - "
+            f"{len(weight_files_to_transfer)} weight files ({weight_size / 1e9:.2f}GB)"
         )
 
-    # Phase 2: Transfer weight files
-    logger.info(
-        f"{get_node_prefix(rank)} Phase 2: Transferring {len(weight_files_to_transfer)} "
-        f"weight files ({weight_size / 1e9:.2f}GB)"
-    )
+        # Transfer each file via all_sum broadcast
+        for filename, file_size in weight_files_to_transfer:
+            if rank == 0:
+                file_src = src_path / filename
+            else:
+                file_src = None
+            file_dst = dst_path / filename
+            transfer_file(file_src, file_dst, file_size, group, chunk_size)
 
-    files_to_transfer = weight_files_to_transfer
-
-    # Transfer each file
-    for filename, file_size in files_to_transfer:
-        if rank == 0:
-            file_src = src_path / filename
-        else:
-            file_src = None
-
-        file_dst = dst_path / filename
-
-        # Skip if file already exists with correct size
-        if rank != 0 and file_dst.exists():
-            if file_dst.stat().st_size == file_size:
-                logger.debug(f"{get_node_prefix(rank)} Skipping {filename} (already exists)")
-                # Still need to participate in all_sum for rank 0's transfer
-                # Actually, we need to skip on all ranks or none
-                # For now, always transfer - could optimize later
-                pass
-
-        transfer_file(file_src, file_dst, file_size, group, chunk_size)
-
-    total_transferred = metadata_size + weight_size
-    logger.info(
-        f"{get_node_prefix(rank)} Model sync complete: "
-        f"{len(metadata_files) + len(files_to_transfer)} files, "
-        f"{total_transferred / 1e9:.2f}GB"
-    )
+        total_transferred = metadata_size + weight_size
+        logger.info(
+            f"{get_node_prefix(rank)} Model sync complete: "
+            f"{len(metadata_files) + len(weight_files_to_transfer)} files, "
+            f"{total_transferred / 1e9:.2f}GB"
+        )
 
     # Return the appropriate path
     if rank == 0:
