@@ -144,11 +144,11 @@ class MLX_LM:
                     ) from e
                 else:
                     raise
+        # Non-distributed mode: standard mlx_lm.load()
         return load(
             model_path,
             lazy=False,
             tokenizer_config={"trust_remote_code": trust_remote_code},
-            weight_loader=weight_loader,
         )
 
     def _distributed_load_with_weight_loader(
