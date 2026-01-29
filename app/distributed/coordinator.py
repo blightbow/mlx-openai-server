@@ -141,7 +141,7 @@ class DistributedCoordinator:
         tokens_broadcast = mx.distributed.all_sum(padded, group=self.group)
         mx.eval(tokens_broadcast)
 
-        # Broadcast generation parameters
+        # Broadcast generation parameters (use -1 for None seed to indicate random)
         params = mx.array(
             [
                 float(max_tokens),
@@ -149,7 +149,7 @@ class DistributedCoordinator:
                 top_p,
                 float(top_k),
                 min_p,
-                float(seed),
+                float(seed if seed is not None else -1),
                 repetition_penalty,
                 float(repetition_context_size),
             ],
@@ -233,8 +233,9 @@ def run_worker_loop(
                 f"[Rank {rank}] Received {actual_length} tokens, max_tokens={max_tokens}"
             )
 
-            # Set random seed for deterministic sampling
-            mx.random.seed(seed)
+            # Set random seed for deterministic sampling (-1 means no seed/random)
+            if seed >= 0:
+                mx.random.seed(seed)
 
             # Create sampler and cache
             sampler = make_sampler(
