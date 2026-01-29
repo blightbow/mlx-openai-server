@@ -295,16 +295,17 @@ class MLX_LM:
             mem_after_pipeline = get_available_memory()
             logger.info(f"[Rank {self.rank}] MEMORY after pipeline(): {mem_after_pipeline / 1e9:.1f}GB available")
 
-            # SKIP warmup forward pass for pipeline mode.
+            # INCREMENTAL PARAMETER EVALUATION for pipeline mode.
             # Running model(warmup_tokens) + mx.eval() causes a memory spike
             # because ALL lazy tensors are evaluated at once. On rank 1
             # (which receives weights via RDMA), this can cause 2x memory:
             # lazy arrays + evaluated arrays coexisting temporarily.
             #
-            # Instead, let lazy evaluation happen incrementally during the
-            # first real request. The pipeline routing handles which rank
-            # executes which layers.
-            logger.info(f"[Rank {self.rank}] Skipping warmup (pipeline mode uses lazy evaluation)")
+            # Solution: Evaluate parameters in small batches to spread out
+            # memory allocation. This forces lazy arrays to materialize
+            # incrementally before the first inference request.
+            logger.info(f"[Rank {self.rank}] Starting incremental parameter evaluation...")
+            self._incremental_eval_parameters(model)
 
             # Synchronize all ranks
             mx.eval(
@@ -317,7 +318,7 @@ class MLX_LM:
             logger.info(f"[Rank {self.rank}] Pipeline setup complete, barrier passed")
 
             mem_after_eval = get_available_memory()
-            logger.info(f"[Rank {self.rank}] MEMORY after warmup: {mem_after_eval / 1e9:.1f}GB available (delta: {(mem_after_pipeline - mem_after_eval) / 1e9:.1f}GB)")
+            logger.info(f"[Rank {self.rank}] MEMORY after incremental eval: {mem_after_eval / 1e9:.1f}GB available (delta: {(mem_after_pipeline - mem_after_eval) / 1e9:.1f}GB)")
 
         # Synchronize all ranks before returning
         mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
@@ -336,11 +337,109 @@ class MLX_LM:
                 except Exception as e:
                     logger.warning(f"[Rank {self.rank}] Model loaded: {param_count:,} params, but sample access failed: {e}")
         else:
-            logger.info(f"[Rank {self.rank}] Model loaded (parameters remain lazy until first request)")
+            logger.info(f"[Rank {self.rank}] Model loaded (parameters evaluated incrementally)")
 
         logger.info(f"[Rank {self.rank}] Model loaded and sharded successfully")
 
         return model, tokenizer
+
+    def _incremental_eval_parameters(
+        self,
+        model,
+        batch_size_gb: float = 8.0,
+    ) -> None:
+        """Evaluate model parameters incrementally to avoid memory spikes.
+
+        After load_weights(), model parameters may be lazy arrays. Evaluating
+        them all at once (e.g., via warmup forward pass) causes 2x memory:
+        lazy source + evaluated destination coexist during evaluation.
+
+        This method evaluates parameters in small batches, allowing the lazy
+        source to be freed before the next batch starts. This spreads memory
+        allocation over time and prevents the spike.
+
+        Args:
+            model: The loaded model
+            batch_size_gb: Target batch size in GB (default 8GB)
+        """
+        from ..distributed.file_sync import get_available_memory
+
+        # Flatten all parameters (tree_flatten returns (values, treedef))
+        params = mx.utils.tree_flatten(model.parameters())[0]
+        if not params:
+            logger.info(f"[Rank {self.rank}] No parameters to evaluate")
+            return
+
+        # Check how many parameters might be lazy (heuristic: check if they have data)
+        # Note: This is diagnostic only - we evaluate all params regardless
+        lazy_count = 0
+        for p in params[:min(10, len(params))]:  # Sample first 10
+            try:
+                # Accessing data triggers evaluation if lazy
+                _ = p.flatten()[0].item()
+            except Exception:
+                lazy_count += 1
+
+        if lazy_count > 0:
+            logger.info(
+                f"[Rank {self.rank}] Detected potentially lazy params "
+                f"({lazy_count}/{min(10, len(params))} sampled)"
+            )
+
+        # Calculate sizes and sort by size (evaluate largest first to catch issues early)
+        param_sizes = [(p, p.nbytes) for p in params]
+        param_sizes.sort(key=lambda x: x[1], reverse=True)
+
+        total_bytes = sum(size for _, size in param_sizes)
+        batch_target_bytes = int(batch_size_gb * 1e9)
+
+        logger.info(
+            f"[Rank {self.rank}] Incremental eval: {len(params)} params, "
+            f"{total_bytes / 1e9:.1f}GB total, {batch_size_gb}GB batch target"
+        )
+
+        # Evaluate in batches
+        batch = []
+        batch_bytes = 0
+        batches_evaluated = 0
+        params_evaluated = 0
+        mem_before = get_available_memory()
+
+        for param, size in param_sizes:
+            # Add to current batch
+            batch.append(param)
+            batch_bytes += size
+
+            # Evaluate when batch is full enough
+            if batch_bytes >= batch_target_bytes:
+                mx.eval(*batch)
+                mx.clear_cache()  # Free any intermediate allocations
+                batches_evaluated += 1
+                params_evaluated += len(batch)
+
+                if batches_evaluated % 5 == 0:
+                    mem_now = get_available_memory()
+                    logger.debug(
+                        f"[Rank {self.rank}] Evaluated batch {batches_evaluated}: "
+                        f"{params_evaluated}/{len(params)} params, "
+                        f"memory: {mem_now / 1e9:.1f}GB available"
+                    )
+
+                batch = []
+                batch_bytes = 0
+
+        # Evaluate remaining parameters
+        if batch:
+            mx.eval(*batch)
+            batches_evaluated += 1
+            params_evaluated += len(batch)
+
+        mx.clear_cache()  # Final cleanup
+        mem_after = get_available_memory()
+        logger.info(
+            f"[Rank {self.rank}] Incremental eval complete: {batches_evaluated} batches, "
+            f"{params_evaluated} params, memory delta: {(mem_before - mem_after) / 1e9:.1f}GB"
+        )
 
     def _apply_pooling_strategy(self, embeddings: mx.array) -> mx.array:
         embeddings = mx.mean(embeddings, axis=1)
