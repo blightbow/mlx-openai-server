@@ -321,6 +321,11 @@ def check_disk_space(cache_path: Path, required_bytes: int) -> tuple[bool, int]:
 def get_available_memory() -> int:
     """Get available system memory in bytes.
 
+    On macOS, calculates total RAM minus wired pages. Wired pages are truly
+    locked in memory; everything else (inactive, purgeable, file cache, etc.)
+    can be reclaimed under memory pressure. Using free+inactive significantly
+    underestimates available memory.
+
     Returns:
         Available memory in bytes
     """
@@ -328,27 +333,35 @@ def get_available_memory() -> int:
     import platform
 
     if platform.system() == "Darwin":
-        # macOS: use vm_stat to get free + inactive pages
+        # macOS: total RAM minus wired pages gives usable memory
         try:
-            result = subprocess.run(
+            # Get total physical memory via sysctl
+            total_result = subprocess.run(
+                ["sysctl", "-n", "hw.memsize"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            total_ram = int(total_result.stdout.strip())
+
+            # Get wired pages from vm_stat (truly locked, can't be reclaimed)
+            vm_result = subprocess.run(
                 ["vm_stat"],
                 capture_output=True,
                 text=True,
                 check=True,
             )
-            # Parse vm_stat output
             page_size = 16384  # Default for Apple Silicon
-            free_pages = 0
-            inactive_pages = 0
-            for line in result.stdout.split("\n"):
+            wired_pages = 0
+            for line in vm_result.stdout.split("\n"):
                 if "page size of" in line:
                     page_size = int(line.split()[-2])
-                elif "Pages free:" in line:
-                    free_pages = int(line.split()[-1].rstrip("."))
-                elif "Pages inactive:" in line:
-                    inactive_pages = int(line.split()[-1].rstrip("."))
-            # Available = free + inactive (can be reclaimed)
-            return (free_pages + inactive_pages) * page_size
+                elif "Pages wired down:" in line:
+                    wired_pages = int(line.split()[-1].rstrip("."))
+
+            # Available = total - wired (everything else can be reclaimed)
+            wired_bytes = wired_pages * page_size
+            return total_ram - wired_bytes
         except Exception:
             pass
 
