@@ -169,6 +169,15 @@ async def start(config: MLXServerConfig) -> None:
                 group = mx.distributed.init()
             rank = group.rank()
             world_size = group.size()
+            logger.info(f"[Rank {rank}] Distributed group initialized: size={world_size}")
+
+            # JACCL warmup barrier: ensure backend is fully ready before collective ops.
+            # Without this, the first all_sum in sync_metadata_to_workers can hang
+            # if JACCL hasn't completed internal setup on both sides.
+            logger.info(f"[Rank {rank}] Running JACCL warmup barrier...")
+            warmup = mx.distributed.all_sum(mx.array([rank], dtype=mx.int32), group=group)
+            mx.eval(warmup)
+            logger.info(f"[Rank {rank}] JACCL warmup complete (sum={warmup[0].item()})")
 
             # Initialize OOB for mlx.launch mode. Skip if already initialized via hostfile.
             # Only JACCL needs OOB - Ring has implicit sync, MPI has built-in rendezvous.
