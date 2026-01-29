@@ -295,23 +295,16 @@ class MLX_LM:
             mem_after_pipeline = get_available_memory()
             logger.info(f"[Rank {self.rank}] MEMORY after pipeline(): {mem_after_pipeline / 1e9:.1f}GB available")
 
-            # APPROACH: Don't call mx.eval(model.parameters()) explicitly.
-            # Let lazy evaluation happen during the first forward pass.
-            # If pipeline() correctly routes computation, only our layers'
-            # parameters will be evaluated, avoiding OOM.
+            # SKIP warmup forward pass for pipeline mode.
+            # Running model(warmup_tokens) + mx.eval() causes a memory spike
+            # because ALL lazy tensors are evaluated at once. On rank 1
+            # (which receives weights via RDMA), this can cause 2x memory:
+            # lazy arrays + evaluated arrays coexisting temporarily.
             #
-            # Run a small forward pass to trigger lazy evaluation
-            logger.info(f"[Rank {self.rank}] Running warmup forward pass to materialize weights...")
-            warmup_tokens = mx.array([[1, 2, 3]], dtype=mx.int32)
-            try:
-                # Just run forward, don't care about output
-                _ = model(warmup_tokens)
-                mx.eval(_)
-            except Exception as e:
-                logger.warning(f"[Rank {self.rank}] Warmup forward pass failed: {e}")
-                # Fall back to explicit eval if warmup fails
-                logger.info(f"[Rank {self.rank}] Falling back to explicit parameter evaluation...")
-                mx.eval(model.parameters())
+            # Instead, let lazy evaluation happen incrementally during the
+            # first real request. The pipeline routing handles which rank
+            # executes which layers.
+            logger.info(f"[Rank {self.rank}] Skipping warmup (pipeline mode uses lazy evaluation)")
 
             # Synchronize all ranks
             mx.eval(
@@ -329,18 +322,21 @@ class MLX_LM:
         # Synchronize all ranks before returning
         mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
 
-        # Diagnostic: verify parameters are materialized
-        params = mx.utils.tree_flatten(model.parameters())[0]
-        param_count = sum(p.size for p in params)
-        # Check if first param has actual data (not just lazy placeholder)
-        if params:
-            first_param = params[0]
-            # Accessing .item() on first element forces evaluation if lazy
-            try:
-                sample_val = first_param.flatten()[0].item()
-                logger.info(f"[Rank {self.rank}] Model loaded: {param_count:,} params, sample={sample_val:.6f}")
-            except Exception as e:
-                logger.warning(f"[Rank {self.rank}] Model loaded: {param_count:,} params, but sample access failed: {e}")
+        # Diagnostic: verify parameters are materialized (skip for pipeline to avoid memory spike)
+        if self.distributed != "pipeline":
+            params = mx.utils.tree_flatten(model.parameters())[0]
+            param_count = sum(p.size for p in params)
+            # Check if first param has actual data (not just lazy placeholder)
+            if params:
+                first_param = params[0]
+                # Accessing .item() on first element forces evaluation if lazy
+                try:
+                    sample_val = first_param.flatten()[0].item()
+                    logger.info(f"[Rank {self.rank}] Model loaded: {param_count:,} params, sample={sample_val:.6f}")
+                except Exception as e:
+                    logger.warning(f"[Rank {self.rank}] Model loaded: {param_count:,} params, but sample access failed: {e}")
+        else:
+            logger.info(f"[Rank {self.rank}] Model loaded (parameters remain lazy until first request)")
 
         logger.info(f"[Rank {self.rank}] Model loaded and sharded successfully")
 
