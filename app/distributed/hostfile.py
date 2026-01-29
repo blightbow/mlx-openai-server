@@ -114,6 +114,7 @@ def setup_jaccl_env(
 
     Sets:
         MLX_RANK: Process rank
+        MLX_WORLD_SIZE: Total number of processes
         MLX_JACCL_COORDINATOR: ip:port of rank 0
         MLX_IBV_DEVICES: Path to temp file with RDMA device mappings
 
@@ -138,8 +139,9 @@ def setup_jaccl_env(
         raise ValueError("Rank 0 host has no IP addresses")
     coordinator_ip = hosts[0].ips[0]
 
-    # Set MLX_RANK
+    # Set MLX_RANK and MLX_WORLD_SIZE
     os.environ["MLX_RANK"] = str(rank)
+    os.environ["MLX_WORLD_SIZE"] = str(world_size)
 
     # Enable fast Metal synchronization for JACCL (macOS 15+/Metal 3.2+).
     # Critical for low-latency RDMA - reduces CPU-GPU sync overhead.
@@ -168,6 +170,7 @@ def setup_jaccl_env(
 
     logger.info(
         f"[Rank {rank}] JACCL env configured: "
+        f"world_size={world_size}, "
         f"coordinator={coordinator_addr}, "
         f"ibv_devices={ibv_file.name}, "
         f"fast_synch=1"
