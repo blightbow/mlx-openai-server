@@ -266,7 +266,7 @@ async def start(config: MLXServerConfig) -> None:
                     model=mlx_lm.model,
                     tokenizer=mlx_lm.tokenizer,
                     group=mlx_lm.group,
-                    max_kv_size=mlx_lm.max_kv_size,
+                    max_kv_size=mlx_lm.context_length,
                 )
                 return  # Never reached, but explicit
 
