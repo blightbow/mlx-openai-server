@@ -122,6 +122,7 @@ async def start(config: MLXServerConfig) -> None:
                     load_hostfile,
                     setup_jaccl_env,
                     get_oob_host_from_hostfile,
+                    derive_authkey,
                 )
 
                 # Determine rank: CLI > env var
@@ -145,12 +146,13 @@ async def start(config: MLXServerConfig) -> None:
                 # Only JACCL needs OOB - Ring has implicit sync, MPI has built-in rendezvous.
                 backend = config.backend or detect_backend()
                 if backend == "jaccl":
-                    # Always use IP from hostfile for OOB - ensures TCPStore only
+                    # Always use IP from hostfile for OOB - ensures manager only
                     # traverses TB5 link, not public interfaces. Ignore hostname overrides.
                     oob_host = get_oob_host_from_hostfile(hosts)
                     oob_port = config.oob_port or int(os.environ.get("MLX_OOB_PORT", "29400"))
                     world_size = len(hosts)
-                    oob = init_oob(explicit_rank, world_size, oob_host, oob_port)
+                    authkey = derive_authkey(hosts)
+                    oob = init_oob(explicit_rank, world_size, oob_host, oob_port, authkey)
                     logger.info(
                         f"[Rank {explicit_rank}] JACCL OOB initialized on TB5 -> "
                         f"{oob_host}:{oob_port}"
