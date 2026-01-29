@@ -162,7 +162,11 @@ async def start(config: MLXServerConfig) -> None:
                     logger.info(f"[Rank {explicit_rank}] Backend={backend}, OOB not needed")
 
             # Initialize distributed group (reads MLX_RANK, MLX_JACCL_COORDINATOR, etc.)
-            group = mx.distributed.init()
+            # Pass backend explicitly when specified to ensure correct coordinator startup
+            if config.backend:
+                group = mx.distributed.init(backend=config.backend, strict=True)
+            else:
+                group = mx.distributed.init()
             rank = group.rank()
             world_size = group.size()
 
