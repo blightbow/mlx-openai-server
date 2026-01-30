@@ -203,9 +203,23 @@ async def start(config: MLXServerConfig) -> None:
 
             # Log result details
             result_val = warmup[0].item()
+            expected_sum = world_size * (world_size - 1) // 2  # 0+1+...+(n-1)
             logger.info(f"[Rank {rank}] JACCL warmup complete: sum={result_val} "
-                       f"(expected {world_size * (world_size - 1) // 2}), "  # 0+1+...+(n-1)
+                       f"(expected {expected_sum}), "
                        f"raw={warmup.tolist()}, dtype={warmup.dtype}")
+
+            # Additional diagnostic: try different values to detect pattern
+            if result_val != expected_sum:
+                logger.warning(f"[Rank {rank}] JACCL MISMATCH detected! Running additional diagnostics...")
+                for test_val in [100, 255, 1000]:
+                    test_input = mx.array([test_val * (rank + 1)], dtype=mx.int32)
+                    mx.eval(test_input)
+                    test_result = mx.distributed.all_sum(test_input, group=group)
+                    mx.eval(test_result)
+                    expected = test_val * 1 + test_val * 2  # rank0 * 1 + rank1 * 2
+                    logger.warning(f"[Rank {rank}] Test {test_val}: input={test_input.tolist()}, "
+                                  f"result={test_result.tolist()}, expected=[{expected}], "
+                                  f"delta={test_result[0].item() - expected}")
 
             # Initialize OOB for mlx.launch mode. Skip if already initialized via hostfile.
             # Only JACCL needs OOB - Ring has implicit sync, MPI has built-in rendezvous.
