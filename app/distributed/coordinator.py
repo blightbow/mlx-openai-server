@@ -129,7 +129,12 @@ class DistributedCoordinator:
 
         # Get OOB for barrier synchronization (protects against JACCL timing issues)
         from .oob import get_oob
+        from .jaccl_patch import reset_call_counter
         oob = get_oob()
+
+        # Reset JACCL patch call counter to keep ranks synchronized.
+        # Both ranks reset before each inference request so transfer IDs match.
+        reset_call_counter()
 
         # Broadcast token length (all_sum pattern: rank 0 data + worker zeros = data)
         length = mx.array([len(tokens)], dtype=mx.int32)
@@ -201,10 +206,15 @@ def run_worker_loop(
         try:
             # Check if coordinator is terminating before blocking on all_sum
             from .oob import get_oob
+            from .jaccl_patch import reset_call_counter
             oob = get_oob()
             if oob is not None and oob.is_any_peer_terminating():
                 logger.info(f"[Rank {rank}] Coordinator is terminating, exiting worker loop")
                 return
+
+            # Reset JACCL patch call counter to keep ranks synchronized.
+            # Both ranks reset before each inference request so transfer IDs match.
+            reset_call_counter()
 
             # all_sum broadcast: we contribute zeros, coordinator contributes data.
             # See module docstring for why we use all_sum() instead of recv_like().

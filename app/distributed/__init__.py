@@ -73,6 +73,12 @@ from .hostfile import (
     setup_jaccl_env,
     get_oob_host_from_hostfile,
 )
+from .jaccl_patch import (
+    patch_jaccl_send_recv,
+    unpatch_jaccl_send_recv,
+    reset_call_counter,
+    is_patched as is_jaccl_patched,
+)
 
 __all__ = [
     # Coordination
@@ -113,4 +119,9 @@ __all__ = [
     "load_hostfile",
     "setup_jaccl_env",
     "get_oob_host_from_hostfile",
+    # JACCL send/recv patches
+    "patch_jaccl_send_recv",
+    "unpatch_jaccl_send_recv",
+    "reset_call_counter",
+    "is_jaccl_patched",
 ]

@@ -157,6 +157,7 @@ async def start(config: MLXServerConfig) -> None:
                 validate_memory_for_streaming,
                 init_oob,
                 synced_all_sum,
+                patch_jaccl_send_recv,
             )
             from .distributed.file_sync import detect_backend
             from .models.mlx_lm import MLX_LM
@@ -322,6 +323,14 @@ async def start(config: MLXServerConfig) -> None:
                 else:
                     oob = None
                     logger.info(f"[Rank {rank}] Backend={backend}, OOB not needed")
+
+            # Patch mx.distributed.send/recv_like for JACCL pipeline parallelism.
+            # JACCL's send/recv lacks MPI's rendezvous, causing hangs in pipeline
+            # forward passes. The patch adds OOB coordination to each send/recv call.
+            current_oob = _oob_coordinator if _oob_coordinator is not None else (oob if 'oob' in locals() else None)
+            if current_oob is not None and config.distributed == "pipeline":
+                patch_jaccl_send_recv()
+                logger.info(f"[Rank {rank}] Patched send/recv for JACCL pipeline parallelism")
 
             # Resolve sync mode: auto uses sharded for pipeline, full for tensor
             sync_mode = config.file_sync
