@@ -335,15 +335,24 @@ class OOBCoordinator:
         sock.setsockopt(zmq.RCVBUF, 4096)
 
     async def _startup_barrier(self) -> None:
-        """Simple startup synchronization using store."""
-        key = f"startup_rank{self.rank}"
+        """Simple startup synchronization using store.
 
-        # Signal our presence
+        Uses two-phase handshake to ensure all ranks complete before any returns:
+        1. Phase 1: Each rank sets presence key, waits for all presence keys
+        2. Phase 2: Each rank sets complete key, waits for all complete keys
+
+        This prevents the coordinator from proceeding to blocking operations
+        (like mx.distributed.init) while workers are still querying the store.
+        """
+        # Phase 1: Signal presence and wait for all ranks
+        key = f"startup_rank{self.rank}"
         await self._store_set(key, "1")
 
-        # Wait for all ranks
         deadline = time.time() + self._timeout_sec
         while True:
+            # Yield to let store server process requests from other ranks
+            await asyncio.sleep(0.05)
+
             all_present = True
             for r in range(self.world_size):
                 if not await self._store_exists(f"startup_rank{r}"):
@@ -358,9 +367,32 @@ class OOBCoordinator:
                     f"[Rank {self.rank}] Startup barrier timed out after {self._timeout_sec}s"
                 )
 
-            await asyncio.sleep(0.01)
+        logger.debug(f"[Rank {self.rank}] Startup phase 1 complete")
 
-        logger.debug(f"[Rank {self.rank}] Startup barrier passed")
+        # Phase 2: Signal completion and wait for all ranks to complete
+        # This ensures no rank returns until all have finished phase 1
+        await self._store_set(f"startup_complete_rank{self.rank}", "1")
+
+        deadline = time.time() + self._timeout_sec
+        while True:
+            # Yield to let store server process requests
+            await asyncio.sleep(0.05)
+
+            all_complete = True
+            for r in range(self.world_size):
+                if not await self._store_exists(f"startup_complete_rank{r}"):
+                    all_complete = False
+                    break
+
+            if all_complete:
+                break
+
+            if time.time() >= deadline:
+                raise PeerTimeoutError(
+                    f"[Rank {self.rank}] Startup completion sync timed out"
+                )
+
+        logger.debug(f"[Rank {self.rank}] Startup phase 2 complete")
 
     async def stop(self) -> None:
         """Stop the OOB coordinator gracefully."""
