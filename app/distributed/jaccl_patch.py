@@ -56,6 +56,8 @@ def _oob_send(
     """OOB-coordinated send for JACCL.
 
     Waits for receiver to signal ready before sending.
+    Forces evaluation to ensure data is actually transferred before
+    signaling completion (MLX operations are lazy by default).
     """
     from .oob import get_oob
 
@@ -73,8 +75,10 @@ def _oob_send(
         logger.error(f"[Rank {oob.rank}] OOB wait_ready failed for send to {dst}: {e}")
         raise
 
-    # Now safe to send
+    # Now safe to send - force evaluation to ensure data is actually transferred
+    # MLX operations are lazy; without eval, the send may not happen until later
     result = _original_send(x, dst, group=group, stream=stream)
+    mx.eval(result)
 
     # Signal completion so receiver knows transfer is done
     oob.signal_complete(transfer_id)
@@ -90,7 +94,8 @@ def _oob_recv_like(
 ) -> mx.array:
     """OOB-coordinated recv_like for JACCL.
 
-    Signals ready before receiving, waits for completion after.
+    Signals ready before receiving, forces evaluation to ensure data
+    is actually received (MLX operations are lazy by default).
     """
     from .oob import get_oob
 
@@ -104,10 +109,13 @@ def _oob_recv_like(
     # Signal that we're ready to receive
     oob.signal_ready(transfer_id)
 
-    # Now safe to receive
+    # Now safe to receive - force evaluation to ensure data is actually transferred
+    # MLX operations are lazy; without eval, the recv may not happen until later,
+    # causing timing issues with subsequent operations
     result = _original_recv_like(x, src, group=group, stream=stream)
+    mx.eval(result)
 
-    # Wait for sender to signal completion
+    # Wait for sender to signal completion (ensures sender has finished)
     try:
         oob.wait_complete(transfer_id, src)
     except Exception as e:
