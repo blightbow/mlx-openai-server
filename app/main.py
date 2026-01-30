@@ -254,6 +254,15 @@ async def start(config: MLXServerConfig) -> None:
             mx.eval(warmup_input)
             logger.info(f"[Rank {rank}] Warmup input: {warmup_input.tolist()}, dtype={warmup_input.dtype}")
 
+            # OOB barrier BEFORE all_sum: ensure both ranks call all_sum simultaneously.
+            # JACCL appears to misbehave if ranks don't enter collective ops together -
+            # data from subsequent operations can be misrouted to earlier ones.
+            current_oob = _oob_coordinator if _oob_coordinator is not None else (oob if 'oob' in locals() else None)
+            if current_oob is not None:
+                logger.info(f"[Rank {rank}] Pre-warmup barrier: synchronizing before all_sum...")
+                current_oob.barrier("pre_warmup")
+                logger.info(f"[Rank {rank}] Pre-warmup barrier passed, calling all_sum...")
+
             # Run all_sum
             warmup = mx.distributed.all_sum(warmup_input, group=group)
             mx.eval(warmup)
