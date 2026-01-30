@@ -281,6 +281,24 @@ async def start(config: MLXServerConfig) -> None:
                     oob.signal_terminating()
                 sys.exit(1)
 
+            # OOB barrier after warmup: ensure BOTH ranks passed the check before proceeding.
+            # JACCL corruption can be asymmetric - one rank may get correct result while
+            # the other gets garbage. Without this barrier, the "good" rank races ahead
+            # while the "bad" rank exits, leaving the good rank stuck waiting.
+            current_oob = _oob_coordinator if _oob_coordinator is not None else (oob if 'oob' in locals() else None)
+            if current_oob is not None:
+                logger.info(f"[Rank {rank}] Post-warmup barrier: confirming all ranks passed...")
+                # Check if peer already signaled termination before we even get to barrier
+                if current_oob.is_any_peer_terminating():
+                    logger.error(f"[Rank {rank}] Peer signaled termination, exiting")
+                    sys.exit(1)
+                current_oob.barrier("post_warmup")
+                # Check again after barrier in case peer signaled during barrier
+                if current_oob.is_any_peer_terminating():
+                    logger.error(f"[Rank {rank}] Peer signaled termination after warmup, exiting")
+                    sys.exit(1)
+                logger.info(f"[Rank {rank}] Post-warmup barrier passed, all ranks healthy")
+
             # Initialize OOB for mlx.launch mode. Skip if already initialized via hostfile.
             # Only JACCL needs OOB - Ring has implicit sync, MPI has built-in rendezvous.
             # See oob.py for details on the OOB coordination layer.
