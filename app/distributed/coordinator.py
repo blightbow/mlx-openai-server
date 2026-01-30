@@ -202,6 +202,8 @@ def run_worker_loop(
     token_template = mx.zeros((MAX_PROMPT_LENGTH,), dtype=mx.int32)
     param_template = mx.zeros((PARAM_COUNT,), dtype=mx.float32)
 
+    from .helpers import PeerTimeoutError
+
     while True:
         try:
             # Check if coordinator is terminating before blocking on all_sum
@@ -220,7 +222,13 @@ def run_worker_loop(
             # See module docstring for why we use all_sum() instead of recv_like().
             # OOB barriers protect against JACCL timing issues under CPU saturation.
             logger.debug(f"[Rank {rank}] Waiting for token length...")
-            length = synced_all_sum(length_template, group, "token_length", oob=oob)
+            try:
+                length = synced_all_sum(length_template, group, "token_length", oob=oob)
+            except PeerTimeoutError:
+                # Idle timeout waiting for coordinator - this is normal when no
+                # requests are pending. Log at debug level and keep waiting.
+                logger.debug(f"[Rank {rank}] Idle, no requests from coordinator")
+                continue
             actual_length = int(length[0].item())
             logger.debug(f"[Rank {rank}] Received length: {actual_length}")
 
