@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Generator, List, Optional, Union
 
 import mlx.core as mx
+import mlx.utils
 from dataclasses import dataclass
 from loguru import logger
 from mlx_lm.generate import GenerationResponse, stream_generate
@@ -325,7 +326,7 @@ class MLX_LM:
 
         # Diagnostic: verify parameters are materialized (skip for pipeline to avoid memory spike)
         if self.distributed != "pipeline":
-            params = mx.utils.tree_flatten(model.parameters())[0]
+            params = mlx.utils.tree_flatten(model.parameters())[0]
             param_count = sum(p.size for p in params)
             # Check if first param has actual data (not just lazy placeholder)
             if params:
@@ -365,7 +366,7 @@ class MLX_LM:
         from ..distributed.file_sync import get_available_memory
 
         # Flatten all parameters (tree_flatten returns (values, treedef))
-        params = mx.utils.tree_flatten(model.parameters())[0]
+        params = mlx.utils.tree_flatten(model.parameters())[0]
         if not params:
             logger.info(f"[Rank {self.rank}] No parameters to evaluate")
             return
