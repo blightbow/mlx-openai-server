@@ -265,14 +265,21 @@ async def start(config: MLXServerConfig) -> None:
                        f"(expected {expected_sum}), "
                        f"raw={warmup.tolist()}, dtype={warmup.dtype}")
 
-            # Check for JACCL mismatch - indicates RDMA issue
+            # Check for JACCL mismatch - indicates RDMA corruption
             if result_val != expected_sum:
-                # 97 = 'a' in ASCII - suspicious pattern
+                # 97 = 'a' in ASCII - suspicious pattern observed in practice
                 other_contribution = result_val - rank
                 logger.error(f"[Rank {rank}] JACCL MISMATCH! Received {other_contribution} from other rank "
                             f"(expected {expected_sum - rank}). "
                             f"ASCII interpretation: '{chr(other_contribution) if 32 <= other_contribution < 127 else '?'}'. "
-                            f"This indicates RDMA corruption - try resetting TB5 interfaces.")
+                            f"This indicates RDMA corruption - reboot both machines to reset JACCL state.")
+
+                # Signal termination to peers and exit - don't continue with corrupted RDMA
+                if _oob_coordinator is not None:
+                    _oob_coordinator.signal_terminating()
+                elif 'oob' in locals() and oob is not None:
+                    oob.signal_terminating()
+                sys.exit(1)
 
             # Initialize OOB for mlx.launch mode. Skip if already initialized via hostfile.
             # Only JACCL needs OOB - Ring has implicit sync, MPI has built-in rendezvous.
