@@ -298,61 +298,6 @@ class TestExceptionTypes:
         assert issubclass(AbortError, Exception)
 
 
-class TestDeriveAuthkey:
-    """Tests for hostfile-based authkey derivation."""
-
-    def test_derive_authkey_deterministic(self) -> None:
-        """Same hostfile content produces same authkey."""
-        from app.distributed.hostfile import HostConfig, derive_authkey
-
-        hosts = [
-            HostConfig(ssh="mac1.local", ips=["192.168.1.10"], rdma=[None, "rdma_en2"]),
-            HostConfig(ssh="mac2.local", ips=["192.168.1.11"], rdma=["rdma_en2", None]),
-        ]
-
-        key1 = derive_authkey(hosts)
-        key2 = derive_authkey(hosts)
-
-        assert key1 == key2
-        assert len(key1) == 16  # SHA256 truncated to 16 bytes
-
-    def test_derive_authkey_different_hostfiles(self) -> None:
-        """Different hostfile content produces different authkeys."""
-        from app.distributed.hostfile import HostConfig, derive_authkey
-
-        hosts1 = [
-            HostConfig(ssh="mac1.local", ips=["192.168.1.10"], rdma=[None, "rdma_en2"]),
-            HostConfig(ssh="mac2.local", ips=["192.168.1.11"], rdma=["rdma_en2", None]),
-        ]
-        hosts2 = [
-            HostConfig(ssh="mac3.local", ips=["192.168.1.20"], rdma=[None, "rdma_en3"]),
-            HostConfig(ssh="mac4.local", ips=["192.168.1.21"], rdma=["rdma_en3", None]),
-        ]
-
-        key1 = derive_authkey(hosts1)
-        key2 = derive_authkey(hosts2)
-
-        assert key1 != key2
-
-    def test_derive_authkey_order_matters(self) -> None:
-        """Host order affects authkey (prevents rank mismatch)."""
-        from app.distributed.hostfile import HostConfig, derive_authkey
-
-        hosts_forward = [
-            HostConfig(ssh="mac1.local", ips=["192.168.1.10"], rdma=[None, "rdma_en2"]),
-            HostConfig(ssh="mac2.local", ips=["192.168.1.11"], rdma=["rdma_en2", None]),
-        ]
-        hosts_reversed = [
-            HostConfig(ssh="mac2.local", ips=["192.168.1.11"], rdma=["rdma_en2", None]),
-            HostConfig(ssh="mac1.local", ips=["192.168.1.10"], rdma=[None, "rdma_en2"]),
-        ]
-
-        key_forward = derive_authkey(hosts_forward)
-        key_reversed = derive_authkey(hosts_reversed)
-
-        assert key_forward != key_reversed
-
-
 class TestInitOOB:
     """Tests for the init_oob convenience function."""
 

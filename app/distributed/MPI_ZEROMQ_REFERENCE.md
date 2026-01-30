@@ -26,6 +26,7 @@ This document captures the mapping between MPI patterns and ZeroMQ implementatio
 | `MPI_Allgather` | All ranks get all data | REQ/REP + PUB/SUB | Medium |
 | `MPI_Comm_split` | Subgroups for pipeline stages | Separate socket groups | Medium |
 | `MPIX_Comm_revoke` (ULFM) | Clean abort on failure | PUB/SUB abort channel | Low |
+| `MPIX_Comm_shrink` (ULFM) | Continue with surviving ranks | Reconnect with subset | High |
 | Request/Test pattern | Poll without blocking | asyncio + poll | Low |
 
 ## Why ZeroMQ Over pynng
@@ -96,6 +97,75 @@ Worker:                            Coordinator:              All Ranks:
 - Coordinator relays to all via PUB
 - Fire-and-forget (no delivery guarantee needed for termination)
 
+## MPI Concepts Reference
+
+### Point-to-Point Communication
+
+| MPI | Description | ZeroMQ |
+|-----|-------------|--------|
+| `MPI_Send` | Blocking send | `sock.send()` |
+| `MPI_Recv` | Blocking receive | `sock.recv()` |
+| `MPI_Isend` | Non-blocking send | `await sock.send()` |
+| `MPI_Irecv` | Non-blocking receive | `await sock.recv()` |
+| `MPI_Sendrecv` | Combined send+recv | Two sockets or DEALER/ROUTER |
+
+### Collective Operations
+
+| MPI | Description | ZeroMQ Pattern |
+|-----|-------------|----------------|
+| `MPI_Barrier` | All ranks synchronize | REQ/REP arrivals + PUB/SUB release |
+| `MPI_Ibarrier` | Non-blocking barrier | Async barrier with asyncio.Event |
+| `MPI_Bcast` | One-to-all | PUB/SUB |
+| `MPI_Reduce` | All-to-one with operation | REQ/REP collect + local reduce |
+| `MPI_Allreduce` | Reduce + broadcast | REQ/REP + reduce + PUB/SUB |
+| `MPI_Gather` | Collect at root | REQ/REP collect |
+| `MPI_Scatter` | Distribute from root | REQ/REP per rank |
+| `MPI_Allgather` | Everyone gets everything | REQ/REP + PUB/SUB |
+
+### Synchronization / Completion
+
+| MPI | Description | ZeroMQ/asyncio |
+|-----|-------------|----------------|
+| `MPI_Request` | Handle for async op | `asyncio.Task` |
+| `MPI_Test` | Non-blocking completion check | `task.done()` |
+| `MPI_Wait` | Block until complete | `await task` |
+| `MPI_Testall` | Test multiple | `all(t.done() for t in tasks)` |
+| `MPI_Waitall` | Wait for all | `await asyncio.gather(*tasks)` |
+| `MPI_Testany` | Test any one | `asyncio.wait(FIRST_COMPLETED)` |
+| `MPI_Cancel` | Cancel operation | `task.cancel()` |
+
+### Fault Tolerance (ULFM)
+
+| MPI | Description | ZeroMQ |
+|-----|-------------|--------|
+| `MPIX_Comm_revoke` | Invalidate communicator | PUB/SUB abort broadcast |
+| `MPIX_Comm_shrink` | Create new comm without failed | Reconnect subset |
+| `MPIX_Comm_failure_ack` | Acknowledge failures | Track in local set |
+| `MPI_ERR_PROC_FAILED` | Process failure error | Custom `PeerTerminatedError` |
+
+## Key Design Insights
+
+### Why REQ/REP + PUB/SUB for Barrier (Not SURVEY)
+
+1. **Count-based, not time-based**: REQ/REP arrivals allow immediate release when count reached
+2. **Lower jitter**: ~1 µs vs SURVEY's ~10 µs (critical for RDMA coordination)
+3. **Async-native**: `await sock.recv()` integrates with asyncio cancellation
+4. **Natural abort**: Set abort flag, pending waits raise AbortError
+
+### Why PUB/SUB for Termination (Not Store Polling)
+
+1. **Immediate delivery**: No polling delay
+2. **Fire-and-forget**: Don't block waiting for ack during shutdown
+3. **All ranks notified**: Single publish reaches everyone
+4. **Decoupled**: Publisher doesn't need to know subscriber count
+
+### Why REQ/REP for Store (Not Shared Memory)
+
+1. **Cross-machine**: Works over TCP, not just same-host
+2. **No locking complexity**: Request serialization handled by ZeroMQ
+3. **Clear ownership**: Rank 0 owns store, workers are clients
+4. **Debuggable**: Can log all store operations
+
 ## Socket Topology
 
 ```
@@ -157,8 +227,23 @@ except asyncio.TimeoutError:
 ### MPI Documentation
 - [MPI Forum Standard 4.1](https://www.mpi-forum.org/docs/mpi-4.1/mpi41-report.pdf)
 - [Open MPI ULFM (Fault Tolerance)](https://docs.open-mpi.org/en/v5.0.x/features/ulfm.html)
+- [MPI Collective Operations - OxRSE](https://train.rse.ox.ac.uk/material/HPCu/high_performance_computing/hpc_mpi/05_collective_communication)
+- [MPI Reduce/Allreduce Tutorial](https://mpitutorial.com/tutorials/mpi-reduce-and-allreduce/)
+- [MPI Groups and Communicators](https://mpitutorial.com/tutorials/introduction-to-groups-and-communicators/)
+- [Non-blocking MPI - LLNL](https://hpc-tutorials.llnl.gov/mpi/non_blocking/)
+- [MPI One-Sided Sync - ENCCS](https://enccs.github.io/intermediate-mpi/one-sided-sync/)
+
+### MPI Progress and Async
+- [MPI Progress For All (arXiv)](https://arxiv.org/html/2405.13807v1)
+- [Intel MPI Async Progress](https://www.intel.com/content/www/us/en/docs/mpi-library/developer-guide-linux/2021-6/asynchronous-progress-control.html)
+- [Open MPI Progress Threads](https://github.com/open-mpi/ompi/wiki/ProgressThreads)
+
+### MPI Protocols
+- [MPI Protocols Overview](https://pavanakumar.github.io/post/mpi-protocols/)
+- [Avoiding Deadlocks - Cornell](https://cvw.cac.cornell.edu/mpip2p/p2p-usage-strategies/avoiding-deadlocks)
 
 ---
 
 *Document created: 2026-01-30*
+*Last updated: 2026-01-30*
 *Replaces: MPI_PYNNG_REFERENCE.md (pynng branch)*

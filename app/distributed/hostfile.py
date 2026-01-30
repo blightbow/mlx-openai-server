@@ -21,7 +21,6 @@ Example usage:
     python -m app.main --hostfile cluster.json --rank 1 --distributed pipeline ...
 """
 
-import hashlib
 import json
 import os
 import tempfile
@@ -194,33 +193,3 @@ def get_oob_host_from_hostfile(hosts: list[HostConfig]) -> str:
     if not hosts or not hosts[0].ips:
         raise ValueError("Cannot determine OOB host: rank 0 has no IP addresses")
     return hosts[0].ips[0]
-
-
-def derive_authkey(hosts: list[HostConfig]) -> bytes:
-    """Derive a cluster-specific authkey from hostfile content.
-
-    PURPOSE: Prevent accidental cross-cluster connections (e.g., two clusters
-    on the same network, misconfigured rank). This is a sanity check, NOT
-    cryptographic security.
-
-    SECURITY MODEL: OOB runs on the JACCL private network (Thunderbolt direct
-    connect or isolated VLAN). Physical network isolation provides security.
-    If an attacker has access to that network, they have physical access to
-    the machines. The authkey prevents accidents, not attacks.
-
-    The key is derived deterministically from hostfile content so all ranks
-    compute the same key without coordination.
-
-    Args:
-        hosts: List of host configs from load_hostfile()
-
-    Returns:
-        16-byte authentication key for multiprocessing.managers
-    """
-    # Include ssh hostnames (user-chosen, less predictable than IPs)
-    # plus IPs and RDMA config for cluster uniqueness
-    content = json.dumps(
-        [{"ssh": h.ssh, "ips": h.ips, "rdma": h.rdma} for h in hosts],
-        sort_keys=True,
-    )
-    return hashlib.sha256(content.encode()).digest()[:16]

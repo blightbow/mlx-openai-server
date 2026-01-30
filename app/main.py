@@ -171,7 +171,6 @@ async def start(config: MLXServerConfig) -> None:
                     load_hostfile,
                     setup_jaccl_env,
                     get_oob_host_from_hostfile,
-                    derive_authkey,
                 )
 
                 # Determine rank: CLI > env var
@@ -200,8 +199,7 @@ async def start(config: MLXServerConfig) -> None:
                     oob_host = get_oob_host_from_hostfile(hosts)
                     oob_port = config.oob_port or int(os.environ.get("MLX_OOB_PORT", "29400"))
                     world_size = len(hosts)
-                    authkey = derive_authkey(hosts)
-                    oob = init_oob(explicit_rank, world_size, oob_host, oob_port, authkey)
+                    oob = await init_oob(explicit_rank, world_size, oob_host, oob_port)
                     logger.info(
                         f"[Rank {explicit_rank}] JACCL OOB initialized on TB5 -> "
                         f"{oob_host}:{oob_port}"
@@ -315,7 +313,7 @@ async def start(config: MLXServerConfig) -> None:
                     oob_host = config.oob_host or os.environ.get("MLX_OOB_HOST")
                     oob_port = config.oob_port or int(os.environ.get("MLX_OOB_PORT", "29400"))
                     if oob_host:
-                        oob = init_oob(rank, world_size, oob_host, oob_port)
+                        oob = await init_oob(rank, world_size, oob_host, oob_port)
                         logger.info(f"[Rank {rank}] JACCL OOB initialized -> {oob_host}:{oob_port}")
                     else:
                         oob = None
