@@ -9,11 +9,20 @@ The Problem:
     mlx-lm's pipeline parallelism uses raw send/recv in the forward pass,
     which hangs on JACCL without coordination.
 
+    Additionally, MLX operations are lazy - recv_like() returns immediately
+    with a lazy array, and the actual RDMA receive buffer isn't posted until
+    mx.eval() is called. If the sender completes its transfer before the
+    receiver posts its buffer, data is lost and the receiver hangs forever.
+
 The Solution:
-    Wrap send/recv with OOB receiver-initiated rendezvous:
-    1. Receiver signals ready via OOB store
-    2. Sender waits for ready signal
-    3. Safe to perform RDMA transfer
+    Use OOB barrier synchronization before each send/recv pair:
+    1. Both sender and receiver reach barrier with matching transfer ID
+    2. After barrier, both call their respective send/recv_like + eval
+    3. RDMA transfer succeeds because both sides post operations together
+
+    The barrier approach is simpler and more robust than ready/complete
+    handshakes because it guarantees both ranks are at the same point
+    before any RDMA operations begin.
 
 Usage:
     # Call once after OOB is initialized and before model inference
@@ -55,9 +64,9 @@ def _oob_send(
 ) -> mx.array:
     """OOB-coordinated send for JACCL.
 
-    Waits for receiver to signal ready before sending.
-    Forces evaluation to ensure data is actually transferred before
-    signaling completion (MLX operations are lazy by default).
+    Uses barrier synchronization to ensure receiver has posted its RDMA
+    buffer before we send. This is critical because MLX operations are lazy -
+    without synchronization, data can be sent before the receive buffer exists.
     """
     from .oob import get_oob
 
@@ -68,20 +77,18 @@ def _oob_send(
 
     transfer_id = _get_transfer_id()
 
-    # Wait for receiver to be ready (receiver-initiated rendezvous)
+    # Barrier ensures both sender and receiver are ready for this transfer.
+    # The receiver will be at this same barrier point, about to post its
+    # receive buffer. After the barrier, both sides proceed together.
     try:
-        oob.wait_ready(transfer_id, dst)
+        oob.barrier(f"xfer_{transfer_id}")
     except Exception as e:
-        logger.error(f"[Rank {oob.rank}] OOB wait_ready failed for send to {dst}: {e}")
+        logger.error(f"[Rank {oob.rank}] OOB barrier failed for send to {dst}: {e}")
         raise
 
-    # Now safe to send - force evaluation to ensure data is actually transferred
-    # MLX operations are lazy; without eval, the send may not happen until later
+    # Now safe to send - receiver is also past barrier and posting its recv
     result = _original_send(x, dst, group=group, stream=stream)
     mx.eval(result)
-
-    # Signal completion so receiver knows transfer is done
-    oob.signal_complete(transfer_id)
 
     return result
 
@@ -94,8 +101,10 @@ def _oob_recv_like(
 ) -> mx.array:
     """OOB-coordinated recv_like for JACCL.
 
-    Signals ready before receiving, forces evaluation to ensure data
-    is actually received (MLX operations are lazy by default).
+    Uses barrier synchronization to ensure we post our RDMA receive buffer
+    at the same time the sender posts its send. This is critical because
+    MLX operations are lazy - without synchronization, the sender might
+    complete its transfer before our buffer exists, losing the data.
     """
     from .oob import get_oob
 
@@ -106,21 +115,18 @@ def _oob_recv_like(
 
     transfer_id = _get_transfer_id()
 
-    # Signal that we're ready to receive
-    oob.signal_ready(transfer_id)
+    # Barrier ensures both sender and receiver are ready for this transfer.
+    # The sender will be at this same barrier point. After the barrier,
+    # both sides proceed to their respective send/recv + eval together.
+    try:
+        oob.barrier(f"xfer_{transfer_id}")
+    except Exception as e:
+        logger.error(f"[Rank {oob.rank}] OOB barrier failed for recv from {src}: {e}")
+        raise
 
-    # Now safe to receive - force evaluation to ensure data is actually transferred
-    # MLX operations are lazy; without eval, the recv may not happen until later,
-    # causing timing issues with subsequent operations
+    # Now safe to receive - sender is also past barrier and posting its send
     result = _original_recv_like(x, src, group=group, stream=stream)
     mx.eval(result)
-
-    # Wait for sender to signal completion (ensures sender has finished)
-    try:
-        oob.wait_complete(transfer_id, src)
-    except Exception as e:
-        logger.error(f"[Rank {oob.rank}] OOB wait_complete failed for recv from {src}: {e}")
-        raise
 
     return result
 
