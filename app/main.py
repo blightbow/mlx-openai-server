@@ -269,7 +269,7 @@ async def start(config: MLXServerConfig) -> None:
             logger.info(f"[Rank {rank}] Pre-warmup: synchronizing via synced_all_sum...")
 
             # Run all_sum with OOB barrier (synced_all_sum handles barrier + all_sum + eval)
-            warmup = synced_all_sum(warmup_input, group, "pre_warmup", oob=current_oob)
+            warmup = await synced_all_sum(warmup_input, group, "pre_warmup", oob=current_oob)
 
             # Log result details
             result_val = warmup[0].item()
