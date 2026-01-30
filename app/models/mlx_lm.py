@@ -308,7 +308,12 @@ class MLX_LM:
             logger.info(f"[Rank {self.rank}] Starting incremental parameter evaluation...")
             self._incremental_eval_parameters(model)
 
-            # Synchronize all ranks
+            # Synchronize all ranks via OOB first, then JACCL all_sum.
+            # JACCL requires ranks to enter collective ops together.
+            from ..distributed.oob import get_oob
+            oob = get_oob()
+            if oob is not None:
+                oob.barrier("pre_pipeline_sync")
             mx.eval(
                 mx.distributed.all_sum(
                     mx.array(1.0),
@@ -321,7 +326,12 @@ class MLX_LM:
             mem_after_eval = get_available_memory()
             logger.info(f"[Rank {self.rank}] MEMORY after incremental eval: {mem_after_eval / 1e9:.1f}GB available (delta: {(mem_after_pipeline - mem_after_eval) / 1e9:.1f}GB)")
 
-        # Synchronize all ranks before returning
+        # Synchronize all ranks before returning.
+        # OOB barrier first to ensure JACCL collective ops are entered together.
+        from ..distributed.oob import get_oob
+        oob = get_oob()
+        if oob is not None:
+            oob.barrier("pre_final_sync")
         mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))
 
         # Diagnostic: verify parameters are materialized (skip for pipeline to avoid memory spike)
