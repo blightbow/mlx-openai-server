@@ -929,3 +929,44 @@ def oob_barrier_sync(name: Optional[str] = None, timeout: Optional[float] = None
             raise
         # No running loop - safe to use run
         asyncio.run(_oob_coordinator.barrier(name or "unnamed", timeout))
+
+
+def _run_sync(coro):
+    """Run a coroutine synchronously, handling event loop presence."""
+    try:
+        loop = asyncio.get_running_loop()
+        raise RuntimeError(
+            "Sync wrapper called from async context. Use async version instead."
+        )
+    except RuntimeError as e:
+        if "no running event loop" not in str(e).lower():
+            raise
+        return asyncio.run(coro)
+
+
+def oob_signal_ready_sync(transfer_id: str) -> None:
+    """Synchronous wrapper for signal_ready."""
+    if _oob_coordinator is None:
+        raise RuntimeError("OOB coordinator not initialized.")
+    _run_sync(_oob_coordinator.signal_ready(transfer_id))
+
+
+def oob_wait_ready_sync(transfer_id: str, receiver_rank: int, timeout: Optional[float] = None) -> None:
+    """Synchronous wrapper for wait_ready."""
+    if _oob_coordinator is None:
+        raise RuntimeError("OOB coordinator not initialized.")
+    _run_sync(_oob_coordinator.wait_ready(transfer_id, receiver_rank, timeout))
+
+
+def oob_signal_complete_sync(transfer_id: str) -> None:
+    """Synchronous wrapper for signal_complete."""
+    if _oob_coordinator is None:
+        raise RuntimeError("OOB coordinator not initialized.")
+    _run_sync(_oob_coordinator.signal_complete(transfer_id))
+
+
+def oob_wait_complete_sync(transfer_id: str, sender_rank: int, timeout: Optional[float] = None) -> None:
+    """Synchronous wrapper for wait_complete."""
+    if _oob_coordinator is None:
+        raise RuntimeError("OOB coordinator not initialized.")
+    _run_sync(_oob_coordinator.wait_complete(transfer_id, sender_rank, timeout))

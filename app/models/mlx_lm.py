@@ -16,7 +16,7 @@ from mlx_lm.utils import load, load_config, load_tokenizer
 from outlines.processors import JSONLogitsProcessor
 
 from ..utils.outlines_transformer_tokenizer import OutlinesTransformerTokenizer
-from ..distributed.helpers import synced_all_sum
+from ..distributed.helpers import synced_all_sum_sync
 
 DEFAULT_TEMPERATURE = os.getenv("DEFAULT_TEMPERATURE", 0.7)
 DEFAULT_TOP_P = os.getenv("DEFAULT_TOP_P", 0.95)
@@ -313,7 +313,7 @@ class MLX_LM:
             # JACCL requires ranks to enter collective ops together.
             from ..distributed.oob import get_oob
             oob = get_oob()
-            synced_all_sum(mx.array(1.0), self.group, "pre_pipeline_sync", oob=oob)
+            synced_all_sum_sync(mx.array(1.0), self.group, "pre_pipeline_sync", oob=oob)
             logger.info(f"[Rank {self.rank}] Pipeline setup complete, barrier passed")
 
             mem_after_eval = get_available_memory()
@@ -323,7 +323,7 @@ class MLX_LM:
         # OOB barrier first to ensure JACCL collective ops are entered together.
         from ..distributed.oob import get_oob
         oob = get_oob()
-        synced_all_sum(mx.array(1.0), self.group, "pre_final_sync", oob=oob)
+        synced_all_sum_sync(mx.array(1.0), self.group, "pre_final_sync", oob=oob)
 
         # Diagnostic: verify parameters are materialized (skip for pipeline to avoid memory spike)
         if self.distributed != "pipeline":

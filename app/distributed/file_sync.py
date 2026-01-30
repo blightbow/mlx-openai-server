@@ -1590,7 +1590,7 @@ def oob_send_file_bytes(
         chunk_size: Override chunk size (auto-detected if None)
         log_file: Optional file handle for timing logs
     """
-    from .oob import get_oob
+    from .oob import get_oob, oob_wait_ready_sync, oob_signal_complete_sync
 
     oob = get_oob()
     if oob is None:
@@ -1604,13 +1604,13 @@ def oob_send_file_bytes(
         raise RuntimeError("Peer terminated before send could complete")
 
     # Wait for receiver to signal ready
-    oob.wait_ready(transfer_id, dst_rank)
+    oob_wait_ready_sync(transfer_id, dst_rank)
 
     # Now safe to send - receiver has posted recv
     send_file_bytes(data, group, dst_rank, chunk_size, log_file)
 
     # Signal completion
-    oob.signal_complete(transfer_id)
+    oob_signal_complete_sync(transfer_id)
 
 
 def oob_recv_file_bytes(
@@ -1637,7 +1637,7 @@ def oob_recv_file_bytes(
     Returns:
         File bytes as bytearray
     """
-    from .oob import get_oob
+    from .oob import get_oob, oob_signal_ready_sync, oob_wait_complete_sync
 
     oob = get_oob()
     if oob is None:
@@ -1651,13 +1651,13 @@ def oob_recv_file_bytes(
         raise RuntimeError("Peer terminated before recv could complete")
 
     # Signal we're ready to receive
-    oob.signal_ready(transfer_id)
+    oob_signal_ready_sync(transfer_id)
 
     # Receive the data
     result = recv_file_bytes(group, src_rank, chunk_size, log_file)
 
     # Wait for sender to confirm completion
-    oob.wait_complete(transfer_id, src_rank)
+    oob_wait_complete_sync(transfer_id, src_rank)
 
     return result
 
@@ -1697,7 +1697,7 @@ def make_distributed_weight_loader(
         >>> loader = make_distributed_weight_loader(group, model_path, "pipeline")
         >>> model, tokenizer = load(model_path, weight_loader=loader)
     """
-    from .oob import get_oob
+    from .oob import get_oob, oob_barrier_sync
 
     rank = group.rank()
     world_size = group.size()
@@ -1790,7 +1790,7 @@ def make_distributed_weight_loader(
         )
 
         # MANIFEST CHECKPOINT: Use OOB barrier to ensure all ranks received manifest
-        oob.barrier("manifest_exchange")
+        oob_barrier_sync("manifest_exchange")
         logger.info(f"{get_node_prefix(rank)} Manifest checkpoint OK: all ranks in sync")
 
     logger.info(
@@ -1812,7 +1812,7 @@ def make_distributed_weight_loader(
 
         # OOB barrier: verify all ranks are in sync before each file transfer.
         # Lighter than all_sum - uses TCPStore key exchange, no data transfer.
-        oob.barrier(f"file_{file_num}")
+        oob_barrier_sync(f"file_{file_num}")
 
         # Check if any peer is terminating before starting RDMA transfer
         if oob.is_any_peer_terminating():
@@ -1972,7 +1972,7 @@ def validate_memory_for_streaming(
         MemoryError: If any rank has insufficient memory
         RuntimeError: If OOB coordinator is not initialized
     """
-    from .oob import get_oob
+    from .oob import get_oob, oob_barrier_sync
 
     rank = group.rank()
     world_size = group.size()
@@ -2040,4 +2040,4 @@ def validate_memory_for_streaming(
         )
 
     # Barrier to ensure all ranks completed memory check before proceeding
-    oob.barrier("memory_validation")
+    oob_barrier_sync("memory_validation")
