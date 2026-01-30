@@ -55,6 +55,17 @@ from .oob import (
     get_oob,
     oob_barrier,
 )
+from .helpers import (
+    PeerTerminatedError,
+    synced_all_sum,
+    broadcast_value,
+    safe_collective,
+)
+from .testing import (
+    MockOOBCoordinator,
+    MockDistributedGroup,
+    mock_all_sum,
+)
 from .hostfile import (
     HostConfig,
     load_hostfile,
@@ -86,6 +97,15 @@ __all__ = [
     "init_oob",
     "get_oob",
     "oob_barrier",
+    # Synchronization helpers
+    "PeerTerminatedError",
+    "synced_all_sum",
+    "broadcast_value",
+    "safe_collective",
+    # Testing infrastructure
+    "MockOOBCoordinator",
+    "MockDistributedGroup",
+    "mock_all_sum",
     # Hostfile (direct execution without mlx.launch)
     "HostConfig",
     "load_hostfile",
