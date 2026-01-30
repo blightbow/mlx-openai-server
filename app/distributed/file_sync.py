@@ -662,11 +662,26 @@ def compute_pipeline_files(
     if not weight_index:
         return None
 
-    # Compute layer assignment (same as PipelineMixin)
-    # Layers are distributed evenly across ranks
+    # Compute layer assignment matching PipelineMixin's REVERSE order:
+    # rank=0 gets the LAST layers, rank=(world_size-1) gets FIRST layers.
+    # See mlx_lm/models/pipeline.py:
+    #   "Split layers in reverse so rank=0 gets the last layers"
     layers_per_rank = num_layers // world_size
-    start_layer = rank * layers_per_rank
-    end_layer = start_layer + layers_per_rank if rank < world_size - 1 else num_layers
+    extra = num_layers - layers_per_rank * world_size
+
+    # Match PipelineMixin's exact formula for handling uneven splits
+    if rank < extra:
+        layers_per_rank_this = layers_per_rank + 1
+    else:
+        layers_per_rank_this = layers_per_rank
+
+    # PipelineMixin: start_idx = (pipeline_size - pipeline_rank - 1) * layers_per_rank
+    # For weight loading, we need the actual layer indices this rank handles
+    start_layer = (world_size - rank - 1) * layers_per_rank
+    if rank < extra:
+        # Adjust for extra layers distributed to lower ranks
+        start_layer += min(extra, world_size - rank - 1)
+    end_layer = start_layer + layers_per_rank_this
 
     # Find files containing parameters for our layers
     needed_files = set()
@@ -685,16 +700,19 @@ def compute_pipeline_files(
                 # Can't parse layer number, include file to be safe
                 needed_files.add(file_name)
         else:
-            # Non-layer parameters - assign based on pipeline position
-            # Embeddings are needed by first rank (processes input)
-            # lm_head/final_norm are needed by last rank (produces output)
+            # Non-layer parameters - assign based on pipeline position:
+            # - Embeddings process input → needed by rank with FIRST layers
+            #   In PipelineMixin's reverse order, that's rank=(world_size-1)
+            # - lm_head produces output → needed by rank with LAST layers
+            #   In PipelineMixin's reverse order, that's rank=0
             param_lower = param_name.lower()
             if "embed" in param_lower:
-                if rank == 0:
+                # Embeddings → first layers → rank (world_size - 1)
+                if rank == world_size - 1:
                     needed_files.add(file_name)
             else:
-                # lm_head, model.norm, etc. → last rank
-                if rank == world_size - 1:
+                # lm_head, model.norm, etc. → last layers → rank 0
+                if rank == 0:
                     needed_files.add(file_name)
 
     return needed_files

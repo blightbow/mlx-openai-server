@@ -181,53 +181,65 @@ class TestPipelineFileComputation:
             yield tmppath
 
     def test_two_rank_pipeline(self, model_dir):
-        """Two ranks split 8 layers evenly (4 each)."""
+        """Two ranks split 8 layers evenly (4 each).
+
+        PipelineMixin uses REVERSE ordering: rank 0 gets LAST layers.
+        See mlx_lm/models/pipeline.py: "Split layers in reverse so
+        rank=0 gets the last layers and rank=pipeline_size-1 gets the first"
+        """
         from app.distributed.file_sync import compute_pipeline_files
 
-        # Rank 0: layers 0-3 + embeddings
+        # Rank 0: layers 4-7 + lm_head (output stage)
         rank0_files = compute_pipeline_files(
             model_dir / "model.safetensors.index.json",
             model_dir / "config.json",
             rank=0,
             world_size=2,
         )
-        assert "model-00001.safetensors" in rank0_files  # layers 0-1 + embed
-        assert "model-00002.safetensors" in rank0_files  # layers 2-3
+        assert "model-00003.safetensors" in rank0_files  # layers 4-5
+        assert "model-00004.safetensors" in rank0_files  # layers 6-7 + lm_head
 
-        # Rank 1: layers 4-7 + lm_head
+        # Rank 1: layers 0-3 + embeddings (input stage)
         rank1_files = compute_pipeline_files(
             model_dir / "model.safetensors.index.json",
             model_dir / "config.json",
             rank=1,
             world_size=2,
         )
-        assert "model-00003.safetensors" in rank1_files  # layers 4-5
-        assert "model-00004.safetensors" in rank1_files  # layers 6-7 + lm_head
+        assert "model-00001.safetensors" in rank1_files  # layers 0-1 + embed
+        assert "model-00002.safetensors" in rank1_files  # layers 2-3
 
-        # Rank 1 should NOT have rank 0's layer-only files
-        assert "model-00002.safetensors" not in rank1_files
+        # Rank 0 should NOT have rank 1's layer-only files
+        assert "model-00002.safetensors" not in rank0_files
 
     def test_four_rank_pipeline(self, model_dir):
-        """Four ranks split 8 layers (2 each)."""
+        """Four ranks split 8 layers (2 each).
+
+        PipelineMixin reverse ordering:
+        - Rank 0: layers 6-7 + lm_head
+        - Rank 1: layers 4-5
+        - Rank 2: layers 2-3
+        - Rank 3: layers 0-1 + embeddings
+        """
         from app.distributed.file_sync import compute_pipeline_files
 
-        # Rank 0: layers 0-1
+        # Rank 0: layers 6-7 + lm_head (output stage)
         rank0_files = compute_pipeline_files(
             model_dir / "model.safetensors.index.json",
             model_dir / "config.json",
             rank=0,
             world_size=4,
         )
-        assert "model-00001.safetensors" in rank0_files
+        assert "model-00004.safetensors" in rank0_files  # layers 6-7 + lm_head
 
-        # Rank 3: layers 6-7 + lm_head
+        # Rank 3: layers 0-1 + embeddings (input stage)
         rank3_files = compute_pipeline_files(
             model_dir / "model.safetensors.index.json",
             model_dir / "config.json",
             rank=3,
             world_size=4,
         )
-        assert "model-00004.safetensors" in rank3_files
+        assert "model-00001.safetensors" in rank3_files  # layers 0-1 + embed
 
     def test_missing_index_returns_none(self, model_dir):
         """Missing index file returns None (fallback to full transfer)."""
@@ -245,7 +257,12 @@ class TestPipelineFileComputation:
         assert result is None
 
     def test_embed_lm_head_separation(self):
-        """Embeddings go to rank 0, lm_head goes to last rank only."""
+        """Embeddings go to last rank (input stage), lm_head goes to rank 0 (output stage).
+
+        PipelineMixin reverse ordering means:
+        - Rank 0 handles LAST layers → needs lm_head/final_norm
+        - Last rank handles FIRST layers → needs embeddings
+        """
         from app.distributed.file_sync import compute_pipeline_files
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -272,27 +289,27 @@ class TestPipelineFileComputation:
             with open(tmppath / "model.safetensors.index.json", "w") as f:
                 json.dump({"weight_map": weight_map}, f)
 
-            # Rank 0: layers 0-1 + embeddings (NOT lm_head)
+            # Rank 0: layers 2-3 + lm_head (output stage, NOT embeddings)
             rank0_files = compute_pipeline_files(
                 tmppath / "model.safetensors.index.json",
                 tmppath / "config.json",
                 rank=0,
                 world_size=2,
             )
-            assert "embed.safetensors" in rank0_files
-            assert "layers-0-1.safetensors" in rank0_files
-            assert "lm_head.safetensors" not in rank0_files
+            assert "layers-2-3.safetensors" in rank0_files
+            assert "lm_head.safetensors" in rank0_files
+            assert "embed.safetensors" not in rank0_files
 
-            # Rank 1: layers 2-3 + lm_head (NOT embeddings)
+            # Rank 1: layers 0-1 + embeddings (input stage, NOT lm_head)
             rank1_files = compute_pipeline_files(
                 tmppath / "model.safetensors.index.json",
                 tmppath / "config.json",
                 rank=1,
                 world_size=2,
             )
-            assert "layers-2-3.safetensors" in rank1_files
-            assert "lm_head.safetensors" in rank1_files
-            assert "embed.safetensors" not in rank1_files
+            assert "layers-0-1.safetensors" in rank1_files
+            assert "embed.safetensors" in rank1_files
+            assert "lm_head.safetensors" not in rank1_files
 
 
 class TestNodePrefix:
