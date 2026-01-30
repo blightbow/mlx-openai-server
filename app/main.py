@@ -31,20 +31,32 @@ import uvicorn
 from loguru import logger
 
 
-# Global reference to distributed group for cleanup
+# Global references for cleanup
 _distributed_group = None
+_oob_coordinator = None
 
 
 def _jaccl_cleanup():
     """Attempt to clean up JACCL state on exit.
 
     JACCL doesn't expose a finalize() API, but we can try to:
-    1. Synchronize any pending operations
-    2. Clear the MLX cache
+    1. Signal termination to peers via OOB (so they stop RDMA operations)
+    2. Synchronize any pending operations
+    3. Clear the MLX cache
 
     This may help reduce corruption from ungraceful termination.
     """
-    global _distributed_group
+    global _distributed_group, _oob_coordinator
+
+    # First, signal termination to peers via OOB
+    # This is critical - it tells other ranks to stop RDMA operations
+    if _oob_coordinator is not None:
+        try:
+            _oob_coordinator.signal_terminating()
+        except Exception as e:
+            logger.debug(f"OOB termination signal failed: {e}")
+
+    # Then try to clean up JACCL/MLX state
     if _distributed_group is not None:
         try:
             import mlx.core as mx
@@ -207,8 +219,10 @@ async def start(config: MLXServerConfig) -> None:
             logger.info(f"[Rank {rank}] Distributed group initialized: size={world_size}")
 
             # Register cleanup handlers to reduce JACCL corruption from ungraceful termination
-            global _distributed_group
+            global _distributed_group, _oob_coordinator
             _distributed_group = group
+            # oob may be set from hostfile path or mlx.launch path
+            _oob_coordinator = oob if 'oob' in locals() else None
             atexit.register(_jaccl_cleanup)
             signal.signal(signal.SIGINT, _signal_handler)
             signal.signal(signal.SIGTERM, _signal_handler)

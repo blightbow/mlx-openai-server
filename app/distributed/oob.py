@@ -345,6 +345,51 @@ class OOBCoordinator:
         self._barrier.wait()
         logger.debug(f"[Rank {self.rank}] Barrier{f' {name}' if name else ''}: passed")
 
+    def signal_terminating(self) -> None:
+        """Signal that this rank is terminating.
+
+        Call this during shutdown to notify other ranks that they should stop
+        RDMA operations. This helps prevent corruption from one-sided operations
+        against a dead peer.
+        """
+        key = f"terminating_rank{self.rank}"
+        try:
+            self._store[key] = "1"
+            logger.info(f"[Rank {self.rank}] Signaled termination to peers via OOB")
+        except Exception as e:
+            # Connection may already be broken during shutdown
+            logger.debug(f"[Rank {self.rank}] Could not signal termination: {e}")
+
+    def is_any_peer_terminating(self) -> bool:
+        """Check if any peer has signaled termination.
+
+        Returns:
+            True if any other rank has signaled it is terminating
+        """
+        try:
+            for r in range(self.world_size):
+                if r != self.rank:
+                    key = f"terminating_rank{r}"
+                    if key in self._store:
+                        return True
+            return False
+        except Exception:
+            # Connection may be broken
+            return True  # Assume terminating if we can't check
+
+    def check_peers_alive(self) -> bool:
+        """Check if OOB connection is still alive.
+
+        Returns:
+            True if connection appears healthy
+        """
+        try:
+            # Simple connectivity check
+            _ = len(self._store)
+            return True
+        except Exception:
+            return False
+
 
 # Global OOB coordinator instance (initialized lazily)
 _oob_coordinator: Optional[OOBCoordinator] = None
