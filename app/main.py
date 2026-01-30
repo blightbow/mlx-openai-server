@@ -373,8 +373,8 @@ async def start(config: MLXServerConfig) -> None:
                     config.model_path = str(model_path)
 
                 # Validate memory before starting (fail early if insufficient)
-                validate_memory_for_streaming(config.model_path, group)
-                weight_loader = make_distributed_weight_loader(
+                await validate_memory_for_streaming(config.model_path, group)
+                weight_loader = await make_distributed_weight_loader(
                     group,
                     model_path=config.model_path,
                     distributed_mode=config.distributed,

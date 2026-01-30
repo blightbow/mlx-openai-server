@@ -1567,6 +1567,40 @@ def recv_file_bytes(
     return output
 
 
+async def oob_send_file_bytes_async(
+    data: bytes,
+    group: mx.distributed.Group,
+    dst_rank: int,
+    transfer_id: str,
+    chunk_size: Optional[int] = None,
+    log_file=None,
+) -> None:
+    """Async version: Send bytes with OOB receiver-initiated rendezvous.
+
+    Use this from async contexts (e.g., main.py startup).
+    """
+    from .oob import get_oob
+
+    oob = get_oob()
+    if oob is None:
+        raise RuntimeError(
+            "OOB coordinator not initialized. "
+            "Call init_oob() or set MLX_OOB_HOST before using oob_send_file_bytes."
+        )
+
+    if oob.is_any_peer_terminating():
+        raise RuntimeError("Peer terminated before send could complete")
+
+    # Wait for receiver to signal ready
+    await oob.wait_ready(transfer_id, dst_rank)
+
+    # Now safe to send - receiver has posted recv
+    send_file_bytes(data, group, dst_rank, chunk_size, log_file)
+
+    # Signal completion
+    await oob.signal_complete(transfer_id)
+
+
 def oob_send_file_bytes(
     data: bytes,
     group: mx.distributed.Group,
@@ -1611,6 +1645,41 @@ def oob_send_file_bytes(
 
     # Signal completion
     oob_signal_complete_sync(transfer_id)
+
+
+async def oob_recv_file_bytes_async(
+    group: mx.distributed.Group,
+    src_rank: int,
+    transfer_id: str,
+    chunk_size: Optional[int] = None,
+    log_file=None,
+) -> bytearray:
+    """Async version: Receive bytes with OOB receiver-initiated rendezvous.
+
+    Use this from async contexts (e.g., main.py startup).
+    """
+    from .oob import get_oob
+
+    oob = get_oob()
+    if oob is None:
+        raise RuntimeError(
+            "OOB coordinator not initialized. "
+            "Call init_oob() or set MLX_OOB_HOST before using oob_recv_file_bytes."
+        )
+
+    if oob.is_any_peer_terminating():
+        raise RuntimeError("Peer terminated before recv could complete")
+
+    # Signal we're ready to receive
+    await oob.signal_ready(transfer_id)
+
+    # Receive the data
+    result = recv_file_bytes(group, src_rank, chunk_size, log_file)
+
+    # Wait for sender to confirm completion
+    await oob.wait_complete(transfer_id, src_rank)
+
+    return result
 
 
 def oob_recv_file_bytes(
@@ -1662,7 +1731,7 @@ def oob_recv_file_bytes(
     return result
 
 
-def make_distributed_weight_loader(
+async def make_distributed_weight_loader(
     group: mx.distributed.Group,
     model_path: str = None,
     distributed_mode: str = None,
@@ -1683,6 +1752,10 @@ def make_distributed_weight_loader(
 
     Requires OOB coordinator to be initialized via init_oob() before calling.
 
+    Note: This is an async function because it performs OOB coordination during
+    setup. The returned weight loader closure is synchronous for compatibility
+    with mlx-lm's load_model.
+
     Args:
         group: MLX distributed group
         model_path: Path to model directory (for computing needed files)
@@ -1693,11 +1766,11 @@ def make_distributed_weight_loader(
 
     Example:
         >>> group = mx.distributed.init()
-        >>> init_oob(rank, world_size, "coordinator_host", 29400)
-        >>> loader = make_distributed_weight_loader(group, model_path, "pipeline")
+        >>> await init_oob(rank, world_size, "coordinator_host", 29400)
+        >>> loader = await make_distributed_weight_loader(group, model_path, "pipeline")
         >>> model, tokenizer = load(model_path, weight_loader=loader)
     """
-    from .oob import get_oob, oob_barrier_sync
+    from .oob import get_oob
 
     rank = group.rank()
     world_size = group.size()
@@ -1762,8 +1835,8 @@ def make_distributed_weight_loader(
             # Send manifest to each worker via OOB-coordinated send
             for dst_rank in range(1, world_size):
                 transfer_id = f"manifest_to_rank{dst_rank}"
-                oob_send_file_bytes(manifest_json, group, dst_rank, transfer_id,
-                                    chunk_size=chunk_size)
+                await oob_send_file_bytes_async(manifest_json, group, dst_rank, transfer_id,
+                                                chunk_size=chunk_size)
 
             # Extract for local use
             file_order = manifest.get("file_order", [])
@@ -1771,8 +1844,8 @@ def make_distributed_weight_loader(
         else:
             # Workers receive manifest via OOB-coordinated recv
             transfer_id = f"manifest_to_rank{rank}"
-            manifest_bytes = oob_recv_file_bytes(group, src_rank=0, transfer_id=transfer_id,
-                                                  chunk_size=chunk_size)
+            manifest_bytes = await oob_recv_file_bytes_async(group, src_rank=0, transfer_id=transfer_id,
+                                                              chunk_size=chunk_size)
             manifest = json.loads(manifest_bytes.decode("utf-8"))
             del manifest_bytes
 
@@ -1790,7 +1863,7 @@ def make_distributed_weight_loader(
         )
 
         # MANIFEST CHECKPOINT: Use OOB barrier to ensure all ranks received manifest
-        oob_barrier_sync("manifest_exchange")
+        await oob.barrier("manifest_exchange")
         logger.info(f"{get_node_prefix(rank)} Manifest checkpoint OK: all ranks in sync")
 
     logger.info(
@@ -1952,7 +2025,7 @@ def get_weight_loader_file_list(weight_loader: Callable) -> Optional[list]:
     return getattr(weight_loader, "file_order", None)
 
 
-def validate_memory_for_streaming(
+async def validate_memory_for_streaming(
     model_path: str,
     group: mx.distributed.Group,
 ) -> None:
@@ -1972,7 +2045,7 @@ def validate_memory_for_streaming(
         MemoryError: If any rank has insufficient memory
         RuntimeError: If OOB coordinator is not initialized
     """
-    from .oob import get_oob, oob_barrier_sync
+    from .oob import get_oob
 
     rank = group.rank()
     world_size = group.size()
@@ -2009,13 +2082,13 @@ def validate_memory_for_streaming(
         sizes_bytes = sizes_json.encode("utf-8")
         for dst_rank in range(1, world_size):
             transfer_id = f"memory_validation_to_rank{dst_rank}"
-            oob_send_file_bytes(sizes_bytes, group, dst_rank, transfer_id,
-                                chunk_size=chunk_size)
+            await oob_send_file_bytes_async(sizes_bytes, group, dst_rank, transfer_id,
+                                            chunk_size=chunk_size)
     else:
         # Workers receive size info via OOB-coordinated recv
         transfer_id = f"memory_validation_to_rank{rank}"
-        sizes_bytes = oob_recv_file_bytes(group, src_rank=0, transfer_id=transfer_id,
-                                           chunk_size=chunk_size)
+        sizes_bytes = await oob_recv_file_bytes_async(group, src_rank=0, transfer_id=transfer_id,
+                                                       chunk_size=chunk_size)
         sizes_data = json.loads(sizes_bytes.decode("utf-8"))
         total_size = sizes_data["total_size"]
         max_file_size = sizes_data["max_file_size"]
@@ -2040,4 +2113,4 @@ def validate_memory_for_streaming(
         )
 
     # Barrier to ensure all ranks completed memory check before proceeding
-    oob_barrier_sync("memory_validation")
+    await oob.barrier("memory_validation")
