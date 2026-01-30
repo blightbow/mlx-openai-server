@@ -208,18 +208,14 @@ async def start(config: MLXServerConfig) -> None:
                        f"(expected {expected_sum}), "
                        f"raw={warmup.tolist()}, dtype={warmup.dtype}")
 
-            # Additional diagnostic: try different values to detect pattern
+            # Check for JACCL mismatch - indicates RDMA issue
             if result_val != expected_sum:
-                logger.warning(f"[Rank {rank}] JACCL MISMATCH detected! Running additional diagnostics...")
-                for test_val in [100, 255, 1000]:
-                    test_input = mx.array([test_val * (rank + 1)], dtype=mx.int32)
-                    mx.eval(test_input)
-                    test_result = mx.distributed.all_sum(test_input, group=group)
-                    mx.eval(test_result)
-                    expected = test_val * 1 + test_val * 2  # rank0 * 1 + rank1 * 2
-                    logger.warning(f"[Rank {rank}] Test {test_val}: input={test_input.tolist()}, "
-                                  f"result={test_result.tolist()}, expected=[{expected}], "
-                                  f"delta={test_result[0].item() - expected}")
+                # 97 = 'a' in ASCII - suspicious pattern
+                other_contribution = result_val - rank
+                logger.error(f"[Rank {rank}] JACCL MISMATCH! Received {other_contribution} from other rank "
+                            f"(expected {expected_sum - rank}). "
+                            f"ASCII interpretation: '{chr(other_contribution) if 32 <= other_contribution < 127 else '?'}'. "
+                            f"This indicates RDMA corruption - try resetting TB5 interfaces.")
 
             # Initialize OOB for mlx.launch mode. Skip if already initialized via hostfile.
             # Only JACCL needs OOB - Ring has implicit sync, MPI has built-in rendezvous.
