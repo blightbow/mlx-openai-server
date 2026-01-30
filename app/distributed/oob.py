@@ -321,9 +321,6 @@ class OOBCoordinator:
         # Bounded graceful shutdown (100ms max wait)
         sock.setsockopt(zmq.LINGER, 100)
 
-        # Don't buffer to incomplete connections
-        sock.setsockopt(zmq.IMMEDIATE, 1)
-
         # Small buffers for latency over throughput
         sock.setsockopt(zmq.SNDBUF, 4096)
         sock.setsockopt(zmq.RCVBUF, 4096)

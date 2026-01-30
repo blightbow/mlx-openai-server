@@ -52,7 +52,15 @@ def _jaccl_cleanup():
     # This is critical - it tells other ranks to stop RDMA operations
     if _oob_coordinator is not None:
         try:
-            _oob_coordinator.signal_terminating()
+            # signal_terminating is async, but we're in a sync cleanup handler
+            # Use asyncio to run it if there's an event loop
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(_oob_coordinator.signal_terminating())
+            except RuntimeError:
+                # No running loop - try to run synchronously
+                asyncio.run(_oob_coordinator.signal_terminating())
         except Exception as e:
             logger.debug(f"OOB termination signal failed: {e}")
 
@@ -281,9 +289,9 @@ async def start(config: MLXServerConfig) -> None:
 
                 # Signal termination to peers and exit - don't continue with corrupted RDMA
                 if _oob_coordinator is not None:
-                    _oob_coordinator.signal_terminating()
+                    await _oob_coordinator.signal_terminating()
                 elif 'oob' in locals() and oob is not None:
-                    oob.signal_terminating()
+                    await oob.signal_terminating()
                 sys.exit(1)
 
             # OOB barrier after warmup: ensure BOTH ranks passed the check before proceeding.
@@ -297,7 +305,7 @@ async def start(config: MLXServerConfig) -> None:
                 if current_oob.is_any_peer_terminating():
                     logger.error(f"[Rank {rank}] Peer signaled termination, exiting")
                     sys.exit(1)
-                current_oob.barrier("post_warmup")
+                await current_oob.barrier("post_warmup")
                 # Check again after barrier in case peer signaled during barrier
                 if current_oob.is_any_peer_terminating():
                     logger.error(f"[Rank {rank}] Peer signaled termination after warmup, exiting")
