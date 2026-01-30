@@ -56,6 +56,8 @@ import mlx.core as mx
 import numpy as np
 from loguru import logger
 
+from .helpers import broadcast_value, synced_all_sum
+
 
 # Safetensors dtype string -> (numpy dtype for raw bytes, mlx dtype, element size)
 # For types numpy doesn't support natively (BF16), we use uint of same size
@@ -466,8 +468,7 @@ def broadcast_manifest(
     else:
         count = mx.zeros((1,), dtype=mx.int32)
 
-    count_result = mx.distributed.all_sum(count, group=group)
-    mx.eval(count_result)
+    count_result = synced_all_sum(count, group, "manifest_count")
     file_count = int(count_result[0].item())
 
     if file_count == 0:
@@ -489,8 +490,7 @@ def broadcast_manifest(
         else:
             header = mx.zeros((2,), dtype=mx.int64)
 
-        header_result = mx.distributed.all_sum(header, group=group)
-        mx.eval(header_result)
+        header_result = synced_all_sum(header, group, f"manifest_header_{i}")
         name_len = int(header_result[0].item())
         file_size = int(header_result[1].item())
 
@@ -504,8 +504,7 @@ def broadcast_manifest(
         else:
             name_array = mx.zeros((MAX_FILENAME_LENGTH,), dtype=mx.uint8)
 
-        name_result = mx.distributed.all_sum(name_array, group=group)
-        mx.eval(name_result)
+        name_result = synced_all_sum(name_array, group, f"manifest_name_{i}")
 
         # Decode filename
         name_bytes = np.array(name_result[:name_len], copy=False).tobytes()
@@ -554,10 +553,22 @@ def transfer_file(
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         dst_file = open(dst_path, 'wb')
 
+    # Get OOB for termination checking
+    from .oob import get_oob
+    oob = get_oob()
+
     try:
         bytes_transferred = 0
 
         for chunk_idx in range(num_chunks):
+            # Periodic termination check (every 10 chunks) to allow graceful abort
+            if chunk_idx > 0 and chunk_idx % 10 == 0:
+                if oob is not None and oob.is_any_peer_terminating():
+                    raise TransferError(
+                        f"Peer terminated during transfer of {dst_path.name} "
+                        f"(chunk {chunk_idx}/{num_chunks})"
+                    )
+
             # Calculate chunk size (last chunk may be smaller)
             remaining = file_size - bytes_transferred
             this_chunk_size = min(chunk_size, remaining)
@@ -755,8 +766,7 @@ def broadcast_rank_assignments(
         size_array = mx.zeros((1,), dtype=mx.int64)
 
     # Broadcast size
-    size_result = mx.distributed.all_sum(size_array, group=group)
-    mx.eval(size_result)
+    size_result = synced_all_sum(size_array, group, "assignments_size")
     data_size = int(size_result[0].item())
 
     if data_size == 0:
@@ -770,8 +780,7 @@ def broadcast_rank_assignments(
     else:
         data_array = mx.zeros((data_size,), dtype=mx.uint8)
 
-    data_result = mx.distributed.all_sum(data_array, group=group)
-    mx.eval(data_result)
+    data_result = synced_all_sum(data_array, group, "assignments_data")
 
     # Deserialize
     data_bytes = np.array(data_result, copy=False).tobytes()
@@ -1263,8 +1272,7 @@ def broadcast_file_bytes(
     t_read = time.perf_counter()
 
     # Broadcast file size
-    size_result = mx.distributed.all_sum(size_array, group=group)
-    mx.eval(size_result)
+    size_result = synced_all_sum(size_array, group, "file_size")
     file_size = int(size_result[0].item())
     del size_array, size_result
 
@@ -1290,7 +1298,19 @@ def broadcast_file_bytes(
     t_alloc = time.perf_counter()
     chunk_times = []
 
+    # Get OOB for termination checking
+    from .oob import get_oob
+    oob = get_oob()
+
     for chunk_idx in range(num_chunks):
+        # Periodic termination check (every 10 chunks) to allow graceful abort
+        if chunk_idx > 0 and chunk_idx % 10 == 0:
+            if oob is not None and oob.is_any_peer_terminating():
+                raise TransferError(
+                    f"Peer terminated during broadcast of {file_path} "
+                    f"(chunk {chunk_idx}/{num_chunks})"
+                )
+
         t_chunk_start = time.perf_counter()
         remaining = file_size - bytes_transferred
         this_chunk_size = min(chunk_size, remaining)

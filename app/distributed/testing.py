@@ -90,15 +90,17 @@ class MockOOBCoordinator:
         oob.assert_ready_signaled("transfer_1")
     """
 
-    def __init__(self, rank: int = 0, world_size: int = 1):
+    def __init__(self, rank: int = 0, world_size: int = 1, timeout_sec: float = 300.0):
         """Initialize the mock coordinator.
 
         Args:
             rank: Simulated rank (default: 0)
             world_size: Simulated world size (default: 1)
+            timeout_sec: Simulated timeout (default: 300.0)
         """
         self.rank = rank
         self.world_size = world_size
+        self._timeout_sec = timeout_sec
 
         # Tracking sets/dicts for assertions
         self.barriers_entered: Set[str] = set()
@@ -109,12 +111,22 @@ class MockOOBCoordinator:
         self._peer_terminating = False
         self._self_terminating = False
 
-    def barrier(self, name: Optional[str] = None) -> None:
+    def barrier(self, name: Optional[str] = None, timeout: float = None) -> None:
         """Record a barrier call.
 
         Args:
             name: Optional barrier name for tracking
+            timeout: Ignored in mock (for API compatibility)
+
+        Raises:
+            PeerTerminatedError: If peer termination is simulated
         """
+        from .helpers import PeerTerminatedError
+
+        if self._peer_terminating:
+            raise PeerTerminatedError(
+                f"[Rank {self.rank}] Peer terminated before barrier{f' {name}' if name else ''}"
+            )
         if name is not None:
             self.barriers_entered.add(name)
 
@@ -126,14 +138,26 @@ class MockOOBCoordinator:
         """
         self.ready_signals[transfer_id] = self.rank
 
-    def wait_ready(self, transfer_id: str, receiver_rank: int) -> None:
-        """Simulate waiting for ready signal (no-op in mock).
+    def wait_ready(
+        self, transfer_id: str, receiver_rank: int, timeout: float = None
+    ) -> None:
+        """Simulate waiting for ready signal.
 
         Args:
             transfer_id: The transfer identifier
             receiver_rank: The rank to wait for
+            timeout: Ignored in mock (for API compatibility)
+
+        Raises:
+            PeerTerminatedError: If peer termination is simulated
         """
-        pass
+        from .helpers import PeerTerminatedError
+
+        if self._peer_terminating:
+            raise PeerTerminatedError(
+                f"[Rank {self.rank}] Peer terminated while waiting for "
+                f"rank {receiver_rank} ready signal for {transfer_id}"
+            )
 
     def signal_complete(self, transfer_id: str) -> None:
         """Record a complete signal.
@@ -143,14 +167,26 @@ class MockOOBCoordinator:
         """
         self.complete_signals[transfer_id] = self.rank
 
-    def wait_complete(self, transfer_id: str, sender_rank: int) -> None:
-        """Simulate waiting for complete signal (no-op in mock).
+    def wait_complete(
+        self, transfer_id: str, sender_rank: int, timeout: float = None
+    ) -> None:
+        """Simulate waiting for complete signal.
 
         Args:
             transfer_id: The transfer identifier
             sender_rank: The rank to wait for
+            timeout: Ignored in mock (for API compatibility)
+
+        Raises:
+            PeerTerminatedError: If peer termination is simulated
         """
-        pass
+        from .helpers import PeerTerminatedError
+
+        if self._peer_terminating:
+            raise PeerTerminatedError(
+                f"[Rank {self.rank}] Peer terminated while waiting for "
+                f"rank {sender_rank} complete signal for {transfer_id}"
+            )
 
     def signal_terminating(self) -> None:
         """Record that this rank is terminating."""

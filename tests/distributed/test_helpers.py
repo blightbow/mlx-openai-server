@@ -13,6 +13,7 @@ import mlx.core as mx
 
 from app.distributed.helpers import (
     PeerTerminatedError,
+    PeerTimeoutError,
     broadcast_value,
     safe_collective,
     synced_all_sum,
@@ -398,6 +399,67 @@ class TestPeerTerminatedError:
             raise PeerTerminatedError("peer 2 died")
         except PeerTerminatedError as e:
             assert "peer 2 died" in str(e)
+
+
+class TestPeerTimeoutError:
+    """Tests for PeerTimeoutError exception class."""
+
+    def test_is_exception(self):
+        """PeerTimeoutError is an Exception subclass."""
+        assert issubclass(PeerTimeoutError, Exception)
+
+    def test_can_be_raised_and_caught(self):
+        """PeerTimeoutError can be raised and caught."""
+        with pytest.raises(PeerTimeoutError):
+            raise PeerTimeoutError("timeout waiting for peer")
+
+    def test_message_preserved(self):
+        """Exception message is preserved."""
+        try:
+            raise PeerTimeoutError("timeout after 30s")
+        except PeerTimeoutError as e:
+            assert "timeout after 30s" in str(e)
+
+    def test_distinct_from_terminated(self):
+        """PeerTimeoutError is distinct from PeerTerminatedError."""
+        assert PeerTimeoutError is not PeerTerminatedError
+        with pytest.raises(PeerTimeoutError):
+            raise PeerTimeoutError("timeout")
+        # Should not catch as PeerTerminatedError
+        try:
+            raise PeerTimeoutError("timeout")
+        except PeerTerminatedError:
+            pytest.fail("PeerTimeoutError should not be caught as PeerTerminatedError")
+        except PeerTimeoutError:
+            pass  # Expected
+
+
+class TestMockOOBCoordinatorTimeoutBehavior:
+    """Tests for MockOOBCoordinator timeout and termination behavior."""
+
+    def test_barrier_raises_on_peer_termination(self):
+        """barrier() raises PeerTerminatedError when peer is terminating."""
+        oob = MockOOBCoordinator()
+        oob.simulate_peer_termination()
+
+        with pytest.raises(PeerTerminatedError):
+            oob.barrier("test")
+
+    def test_wait_ready_raises_on_peer_termination(self):
+        """wait_ready() raises PeerTerminatedError when peer is terminating."""
+        oob = MockOOBCoordinator()
+        oob.simulate_peer_termination()
+
+        with pytest.raises(PeerTerminatedError):
+            oob.wait_ready("transfer_1", receiver_rank=1)
+
+    def test_wait_complete_raises_on_peer_termination(self):
+        """wait_complete() raises PeerTerminatedError when peer is terminating."""
+        oob = MockOOBCoordinator()
+        oob.simulate_peer_termination()
+
+        with pytest.raises(PeerTerminatedError):
+            oob.wait_complete("transfer_1", sender_rank=0)
 
 
 class TestIntegrationPatterns:

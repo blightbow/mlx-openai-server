@@ -54,6 +54,18 @@ class PeerTerminatedError(Exception):
     pass
 
 
+class PeerTimeoutError(Exception):
+    """Raised when an OOB wait operation times out.
+
+    This exception indicates that an OOB coordination operation (barrier,
+    wait_ready, wait_complete) timed out waiting for a peer. This typically
+    means a peer has crashed or become unresponsive without signaling
+    termination.
+    """
+
+    pass
+
+
 def synced_all_sum(
     data: mx.array,
     group: mx.distributed.Group,

@@ -288,7 +288,9 @@ class OOBCoordinator:
         self._store[key] = "1"
         logger.debug(f"[Rank {self.rank}] Signaled ready for transfer {transfer_id}")
 
-    def wait_ready(self, transfer_id: str, receiver_rank: int) -> None:
+    def wait_ready(
+        self, transfer_id: str, receiver_rank: int, timeout: float = None
+    ) -> None:
         """Wait for a receiver to signal ready.
 
         Call this BEFORE sending via JACCL to ensure receiver has posted recv.
@@ -296,15 +298,43 @@ class OOBCoordinator:
         Args:
             transfer_id: Unique identifier for this transfer
             receiver_rank: Rank of the receiver to wait for
+            timeout: Timeout in seconds (default: self._timeout_sec)
+
+        Raises:
+            PeerTimeoutError: If timeout expires before receiver signals ready
+            PeerTerminatedError: If peer signals termination during wait
         """
+        from .helpers import PeerTerminatedError, PeerTimeoutError
+
+        if timeout is None:
+            timeout = self._timeout_sec
+
         key = f"ready_{transfer_id}_rank{receiver_rank}"
         logger.debug(
             f"[Rank {self.rank}] Waiting for rank {receiver_rank} "
-            f"to be ready for transfer {transfer_id}"
+            f"to be ready for transfer {transfer_id} (timeout={timeout}s)"
         )
-        # Poll until key appears (dict proxy doesn't have blocking wait)
+
+        deadline = time.time() + timeout
+        poll_interval = 0.01  # 10ms between checks
+
         while key not in self._store:
-            time.sleep(0.001)
+            # Check for peer termination
+            if self.is_any_peer_terminating():
+                raise PeerTerminatedError(
+                    f"[Rank {self.rank}] Peer terminated while waiting for "
+                    f"rank {receiver_rank} ready signal for {transfer_id}"
+                )
+
+            # Check timeout
+            if time.time() >= deadline:
+                raise PeerTimeoutError(
+                    f"[Rank {self.rank}] Timeout ({timeout}s) waiting for "
+                    f"rank {receiver_rank} ready signal for {transfer_id}"
+                )
+
+            time.sleep(poll_interval)
+
         logger.debug(
             f"[Rank {self.rank}] Rank {receiver_rank} is ready for transfer {transfer_id}"
         )
@@ -321,28 +351,95 @@ class OOBCoordinator:
         self._store[key] = "1"
         logger.debug(f"[Rank {self.rank}] Signaled complete for transfer {transfer_id}")
 
-    def wait_complete(self, transfer_id: str, sender_rank: int) -> None:
+    def wait_complete(
+        self, transfer_id: str, sender_rank: int, timeout: float = None
+    ) -> None:
         """Wait for a transfer to complete.
 
         Args:
             transfer_id: Unique identifier for this transfer
             sender_rank: Rank that performed the send
-        """
-        key = f"complete_{transfer_id}_rank{sender_rank}"
-        while key not in self._store:
-            time.sleep(0.001)
+            timeout: Timeout in seconds (default: self._timeout_sec)
 
-    def barrier(self, name: Optional[str] = None) -> None:
+        Raises:
+            PeerTimeoutError: If timeout expires before sender signals complete
+            PeerTerminatedError: If peer signals termination during wait
+        """
+        from .helpers import PeerTerminatedError, PeerTimeoutError
+
+        if timeout is None:
+            timeout = self._timeout_sec
+
+        key = f"complete_{transfer_id}_rank{sender_rank}"
+        logger.debug(
+            f"[Rank {self.rank}] Waiting for rank {sender_rank} "
+            f"to complete transfer {transfer_id} (timeout={timeout}s)"
+        )
+
+        deadline = time.time() + timeout
+        poll_interval = 0.01  # 10ms between checks
+
+        while key not in self._store:
+            # Check for peer termination
+            if self.is_any_peer_terminating():
+                raise PeerTerminatedError(
+                    f"[Rank {self.rank}] Peer terminated while waiting for "
+                    f"rank {sender_rank} complete signal for {transfer_id}"
+                )
+
+            # Check timeout
+            if time.time() >= deadline:
+                raise PeerTimeoutError(
+                    f"[Rank {self.rank}] Timeout ({timeout}s) waiting for "
+                    f"rank {sender_rank} complete signal for {transfer_id}"
+                )
+
+            time.sleep(poll_interval)
+
+        logger.debug(
+            f"[Rank {self.rank}] Rank {sender_rank} completed transfer {transfer_id}"
+        )
+
+    def barrier(self, name: Optional[str] = None, timeout: float = None) -> None:
         """Synchronize all ranks.
 
         All ranks must call this method. Blocks until all ranks have arrived.
 
         Args:
-            name: Optional name for debugging (ignored, kept for API compat)
+            name: Optional name for debugging
+            timeout: Timeout in seconds (default: self._timeout_sec)
+
+        Raises:
+            PeerTimeoutError: If timeout expires before all ranks arrive
+            PeerTerminatedError: If peer signals termination (checked before barrier)
         """
-        # Use native threading.Barrier via proxy - much simpler than key-based
-        logger.debug(f"[Rank {self.rank}] Barrier{f' {name}' if name else ''}: waiting")
-        self._barrier.wait()
+        from .helpers import PeerTerminatedError, PeerTimeoutError
+
+        if timeout is None:
+            timeout = self._timeout_sec
+
+        # Check for peer termination before entering barrier
+        # This reduces the window for TOCTOU but doesn't eliminate it entirely
+        if self.is_any_peer_terminating():
+            raise PeerTerminatedError(
+                f"[Rank {self.rank}] Peer terminated before barrier{f' {name}' if name else ''}"
+            )
+
+        logger.debug(
+            f"[Rank {self.rank}] Barrier{f' {name}' if name else ''}: "
+            f"waiting (timeout={timeout}s)"
+        )
+
+        try:
+            # threading.Barrier.wait() accepts timeout and raises BrokenBarrierError on timeout
+            self._barrier.wait(timeout=timeout)
+        except threading.BrokenBarrierError as e:
+            # Check if it's a timeout or if barrier was broken
+            raise PeerTimeoutError(
+                f"[Rank {self.rank}] Barrier{f' {name}' if name else ''} "
+                f"timed out or broken after {timeout}s: {e}"
+            )
+
         logger.debug(f"[Rank {self.rank}] Barrier{f' {name}' if name else ''}: passed")
 
     def signal_terminating(self) -> None:

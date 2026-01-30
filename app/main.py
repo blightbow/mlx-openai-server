@@ -156,6 +156,7 @@ async def start(config: MLXServerConfig) -> None:
                 make_distributed_weight_loader,
                 validate_memory_for_streaming,
                 init_oob,
+                synced_all_sum,
             )
             from .distributed.file_sync import detect_backend
             from .models.mlx_lm import MLX_LM
@@ -258,14 +259,10 @@ async def start(config: MLXServerConfig) -> None:
             # JACCL appears to misbehave if ranks don't enter collective ops together -
             # data from subsequent operations can be misrouted to earlier ones.
             current_oob = _oob_coordinator if _oob_coordinator is not None else (oob if 'oob' in locals() else None)
-            if current_oob is not None:
-                logger.info(f"[Rank {rank}] Pre-warmup barrier: synchronizing before all_sum...")
-                current_oob.barrier("pre_warmup")
-                logger.info(f"[Rank {rank}] Pre-warmup barrier passed, calling all_sum...")
+            logger.info(f"[Rank {rank}] Pre-warmup: synchronizing via synced_all_sum...")
 
-            # Run all_sum
-            warmup = mx.distributed.all_sum(warmup_input, group=group)
-            mx.eval(warmup)
+            # Run all_sum with OOB barrier (synced_all_sum handles barrier + all_sum + eval)
+            warmup = synced_all_sum(warmup_input, group, "pre_warmup", oob=current_oob)
 
             # Log result details
             result_val = warmup[0].item()

@@ -57,6 +57,7 @@ from .oob import (
 )
 from .helpers import (
     PeerTerminatedError,
+    PeerTimeoutError,
     synced_all_sum,
     broadcast_value,
     safe_collective,
@@ -99,6 +100,7 @@ __all__ = [
     "oob_barrier",
     # Synchronization helpers
     "PeerTerminatedError",
+    "PeerTimeoutError",
     "synced_all_sum",
     "broadcast_value",
     "safe_collective",

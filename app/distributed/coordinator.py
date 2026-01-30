@@ -59,6 +59,8 @@ from mlx_lm.generate import stream_generate
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
+from .helpers import synced_all_sum
+
 # Maximum prompt tokens to support (padded for recv_like template)
 MAX_PROMPT_LENGTH = 32768
 
@@ -125,10 +127,13 @@ class DistributedCoordinator:
         # Result: data + 0 + 0 = data (everyone gets coordinator's data).
         # See module docstring for why we use all_sum() here instead of send/recv.
 
+        # Get OOB for barrier synchronization (protects against JACCL timing issues)
+        from .oob import get_oob
+        oob = get_oob()
+
         # Broadcast token length (all_sum pattern: rank 0 data + worker zeros = data)
         length = mx.array([len(tokens)], dtype=mx.int32)
-        length_broadcast = mx.distributed.all_sum(length, group=self.group)
-        mx.eval(length_broadcast)
+        synced_all_sum(length, self.group, "token_length", oob=oob)
 
         # Pad tokens to fixed size and broadcast
         padded = mx.zeros((MAX_PROMPT_LENGTH,), dtype=mx.int32)
@@ -138,8 +143,7 @@ class DistributedCoordinator:
         else:
             padded = token_array[:MAX_PROMPT_LENGTH]
 
-        tokens_broadcast = mx.distributed.all_sum(padded, group=self.group)
-        mx.eval(tokens_broadcast)
+        synced_all_sum(padded, self.group, "tokens", oob=oob)
 
         # Broadcast generation parameters (use -1 for None seed to indicate random)
         params = mx.array(
@@ -155,8 +159,7 @@ class DistributedCoordinator:
             ],
             dtype=mx.float32,
         )
-        params_broadcast = mx.distributed.all_sum(params, group=self.group)
-        mx.eval(params_broadcast)
+        synced_all_sum(params, self.group, "params", oob=oob)
 
         logger.debug(
             f"[Rank 0] Broadcast {len(tokens)} tokens to {self.size - 1} workers"
@@ -205,22 +208,20 @@ def run_worker_loop(
 
             # all_sum broadcast: we contribute zeros, coordinator contributes data.
             # See module docstring for why we use all_sum() instead of recv_like().
+            # OOB barriers protect against JACCL timing issues under CPU saturation.
             logger.debug(f"[Rank {rank}] Waiting for token length...")
-            length = mx.distributed.all_sum(length_template, group=group)
-            mx.eval(length)
+            length = synced_all_sum(length_template, group, "token_length", oob=oob)
             actual_length = int(length[0].item())
             logger.debug(f"[Rank {rank}] Received length: {actual_length}")
 
             # Receive padded tokens
             logger.debug(f"[Rank {rank}] Waiting for tokens...")
-            tokens = mx.distributed.all_sum(token_template, group=group)
-            mx.eval(tokens)
+            tokens = synced_all_sum(token_template, group, "tokens", oob=oob)
             logger.debug(f"[Rank {rank}] Received tokens")
 
             # Receive generation parameters
             logger.debug(f"[Rank {rank}] Waiting for params...")
-            params = mx.distributed.all_sum(param_template, group=group)
-            mx.eval(params)
+            params = synced_all_sum(param_template, group, "params", oob=oob)
             logger.debug(f"[Rank {rank}] Received params")
 
             # Extract parameters
