@@ -327,7 +327,7 @@ class MLX_LM:
 
         # Diagnostic: verify parameters are materialized (skip for pipeline to avoid memory spike)
         if self.distributed != "pipeline":
-            params = mlx.utils.tree_flatten(model.parameters())[0]
+            params = [v for _, v in mlx.utils.tree_flatten(model.parameters())]
             param_count = sum(p.size for p in params)
             # Check if first param has actual data (not just lazy placeholder)
             if params:
@@ -366,8 +366,8 @@ class MLX_LM:
         """
         from ..distributed.file_sync import get_available_memory
 
-        # Flatten all parameters (tree_flatten returns (values, treedef))
-        params = mlx.utils.tree_flatten(model.parameters())[0]
+        # Flatten all parameters (tree_flatten returns list of (key, value) tuples for dicts)
+        params = [v for _, v in mlx.utils.tree_flatten(model.parameters())]
         if not params:
             logger.info(f"[Rank {self.rank}] No parameters to evaluate")
             return
