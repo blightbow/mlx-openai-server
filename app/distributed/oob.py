@@ -208,6 +208,9 @@ class OOBCoordinator:
         self._barrier_waiters: dict[str, list[bytes]] = {}  # name -> list of rank identities
         self._barrier_events: dict[str, asyncio.Event] = {}
 
+        # Lock for serializing store operations (REQ/REP requires strict alternation)
+        self._store_lock = asyncio.Lock()
+
         logger.info(
             f"[Rank {rank}] OOB coordinator created "
             f"(host={host}, port={port}, world_size={world_size})"
@@ -252,8 +255,11 @@ class OOBCoordinator:
 
         self._tasks.append(asyncio.create_task(self._broadcast_listener()))
 
-        # Give background tasks a chance to start
-        await asyncio.sleep(0)
+        # Give background tasks a chance to start their first iteration
+        for _ in range(3):
+            await asyncio.sleep(0.05)
+
+        logger.debug(f"[Rank {self.rank}] Background tasks started")
 
         # Wait for all ranks to connect (simple barrier via store)
         await self._startup_barrier()
@@ -431,8 +437,6 @@ class OOBCoordinator:
         # Coordinator counts as arrived
         arrived = 1
         needed = self.world_size
-
-        logger.info(f"[Rank 0] Barrier '{name}': coordinator waiting for {needed-1} workers")
         deadline = time.time() + timeout
 
         # Wait for all workers to arrive
@@ -447,7 +451,7 @@ class OOBCoordinator:
                 )
 
             # The barrier server loop handles arrivals and signals us
-            await asyncio.sleep(0.001)
+            await asyncio.sleep(0.01)
 
             # Check how many arrived for this barrier
             arrived = 1 + len(self._barrier_waiters.get(name, []))
@@ -466,11 +470,8 @@ class OOBCoordinator:
         arrival_msg = f"ARRIVE:{name}:{self.rank}".encode()
 
         try:
-            logger.info(f"[Rank {self.rank}] Barrier '{name}': sending ARRIVE...")
             await asyncio.wait_for(self._barrier_req.send(arrival_msg), timeout=timeout)
-            logger.info(f"[Rank {self.rank}] Barrier '{name}': ARRIVE sent, waiting for OK...")
             await asyncio.wait_for(self._barrier_req.recv(), timeout=timeout)
-            logger.info(f"[Rank {self.rank}] Barrier '{name}': received OK")
         except asyncio.TimeoutError:
             raise PeerTimeoutError(
                 f"[Rank {self.rank}] Barrier '{name}' arrival timeout after {timeout}s"
@@ -498,41 +499,43 @@ class OOBCoordinator:
 
     async def _barrier_server_loop(self) -> None:
         """Coordinator: Handle barrier arrival requests."""
-        logger.info("[Rank 0] Barrier server loop started")
-        loop_count = 0
+        logger.debug("[Rank 0] Barrier server loop starting")
+
+        # Create poller for more reliable async receive
+        poller = zmq.asyncio.Poller()
+        poller.register(self._barrier_rep, zmq.POLLIN)
+
         while not self._shutdown:
             try:
-                loop_count += 1
-                if loop_count % 100 == 1:  # Log every 10 seconds (100 * 0.1s)
-                    logger.debug(f"[Rank 0] Barrier server loop iteration {loop_count}")
-                msg = await asyncio.wait_for(self._barrier_rep.recv(), timeout=0.1)
-                logger.info(f"[Rank 0] Barrier server received: {msg.decode()}")
-                parts = msg.decode().split(":")
+                # Poll with 100ms timeout (returns list of (socket, event) tuples)
+                events = dict(await poller.poll(timeout=100))
 
-                if parts[0] == "ARRIVE" and len(parts) >= 3:
-                    name = parts[1]
-                    rank = int(parts[2])
+                if self._barrier_rep in events:
+                    msg = await self._barrier_rep.recv(zmq.NOBLOCK)
+                    parts = msg.decode().split(":")
 
-                    if name not in self._barrier_waiters:
-                        self._barrier_waiters[name] = []
-                    self._barrier_waiters[name].append(rank)
+                    if parts[0] == "ARRIVE" and len(parts) >= 3:
+                        name = parts[1]
+                        rank = int(parts[2])
 
-                    # Acknowledge arrival
-                    await self._barrier_rep.send(b"OK")
-                    logger.debug(
-                        f"[Rank 0] Barrier '{name}': rank {rank} arrived "
-                        f"({len(self._barrier_waiters[name]) + 1}/{self.world_size})"
-                    )
-                else:
-                    await self._barrier_rep.send(b"ERR:UNKNOWN")
+                        if name not in self._barrier_waiters:
+                            self._barrier_waiters[name] = []
+                        self._barrier_waiters[name].append(rank)
 
-            except asyncio.TimeoutError:
-                continue
+                        # Acknowledge arrival
+                        await self._barrier_rep.send(b"OK")
+                        logger.debug(
+                            f"[Rank 0] Barrier '{name}': rank {rank} arrived "
+                            f"({len(self._barrier_waiters[name]) + 1}/{self.world_size})"
+                        )
+                    else:
+                        await self._barrier_rep.send(b"ERR:UNKNOWN")
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 if not self._shutdown:
-                    logger.error(f"[Rank 0] Barrier server error: {e}")
+                    logger.error(f"[Rank 0] Barrier server error: {e}", exc_info=True)
 
     # --- Store Operations (REQ/REP pattern) ---
 
@@ -564,6 +567,29 @@ class OOBCoordinator:
                     self._store.pop(key, None)
                     await self._store_rep.send(b"OK")
 
+                elif cmd == "KEYS":
+                    # Return all keys (for debugging)
+                    keys = "\n".join(sorted(self._store.keys()))
+                    await self._store_rep.send(keys.encode())
+
+                elif cmd == "DUMP":
+                    # Dump all key-value pairs (for debugging)
+                    lines = [f"{k}={v}" for k, v in sorted(self._store.items())]
+                    await self._store_rep.send("\n".join(lines).encode())
+
+                elif cmd == "STATUS":
+                    # Return coordinator status for external debugging
+                    status = (
+                        f"rank=0\n"
+                        f"world_size={self.world_size}\n"
+                        f"shutdown={self._shutdown}\n"
+                        f"abort={self._abort_flag}\n"
+                        f"terminating_ranks={','.join(map(str, self._terminating_ranks))}\n"
+                        f"pending_barriers={','.join(self._barrier_waiters.keys())}\n"
+                        f"store_keys={len(self._store)}"
+                    )
+                    await self._store_rep.send(status.encode())
+
                 else:
                     await self._store_rep.send(b"ERR:UNKNOWN")
 
@@ -580,29 +606,32 @@ class OOBCoordinator:
         if self.rank == 0:
             self._store[key] = value
         else:
-            msg = f"SET:{key}:{value}".encode()
-            await self._store_req.send(msg)
-            await self._store_req.recv()
+            async with self._store_lock:
+                msg = f"SET:{key}:{value}".encode()
+                await self._store_req.send(msg)
+                await self._store_req.recv()
 
     async def _store_get(self, key: str) -> str:
         """Get a value from the store."""
         if self.rank == 0:
             return self._store.get(key, "")
         else:
-            msg = f"GET:{key}".encode()
-            await self._store_req.send(msg)
-            data = await self._store_req.recv()
-            return data.decode()
+            async with self._store_lock:
+                msg = f"GET:{key}".encode()
+                await self._store_req.send(msg)
+                data = await self._store_req.recv()
+                return data.decode()
 
     async def _store_exists(self, key: str) -> bool:
         """Check if a key exists in the store."""
         if self.rank == 0:
             return key in self._store
         else:
-            msg = f"EXISTS:{key}".encode()
-            await self._store_req.send(msg)
-            data = await self._store_req.recv()
-            return data == b"1"
+            async with self._store_lock:
+                msg = f"EXISTS:{key}".encode()
+                await self._store_req.send(msg)
+                data = await self._store_req.recv()
+                return data == b"1"
 
     # --- Ready/Complete Signaling ---
 
