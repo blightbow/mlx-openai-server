@@ -429,6 +429,7 @@ class OOBCoordinator:
         arrived = 1
         needed = self.world_size
 
+        logger.info(f"[Rank 0] Barrier '{name}': coordinator waiting for {needed-1} workers")
         deadline = time.time() + timeout
 
         # Wait for all workers to arrive
@@ -462,8 +463,11 @@ class OOBCoordinator:
         arrival_msg = f"ARRIVE:{name}:{self.rank}".encode()
 
         try:
+            logger.info(f"[Rank {self.rank}] Barrier '{name}': sending ARRIVE...")
             await asyncio.wait_for(self._barrier_req.send(arrival_msg), timeout=timeout)
+            logger.info(f"[Rank {self.rank}] Barrier '{name}': ARRIVE sent, waiting for OK...")
             await asyncio.wait_for(self._barrier_req.recv(), timeout=timeout)
+            logger.info(f"[Rank {self.rank}] Barrier '{name}': received OK")
         except asyncio.TimeoutError:
             raise PeerTimeoutError(
                 f"[Rank {self.rank}] Barrier '{name}' arrival timeout after {timeout}s"
@@ -491,6 +495,7 @@ class OOBCoordinator:
 
     async def _barrier_server_loop(self) -> None:
         """Coordinator: Handle barrier arrival requests."""
+        logger.info("[Rank 0] Barrier server loop started")
         while not self._shutdown:
             try:
                 msg = await asyncio.wait_for(self._barrier_rep.recv(), timeout=0.1)
