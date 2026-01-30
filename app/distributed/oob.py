@@ -442,6 +442,22 @@ class OOBCoordinator:
 
         logger.debug(f"[Rank {self.rank}] Barrier{f' {name}' if name else ''}: passed")
 
+    def reset_barrier(self) -> None:
+        """Reset the barrier after a timeout or broken state.
+
+        Call this after catching PeerTimeoutError from a barrier wait to make
+        the barrier usable again. Python's threading.Barrier enters a broken
+        state after timeout and cannot be used until reset.
+
+        Important: Only call this when the barrier is broken (after timeout).
+        Calling reset() while other parties are waiting is undefined behavior.
+        """
+        try:
+            self._barrier.reset()
+            logger.debug(f"[Rank {self.rank}] Barrier reset")
+        except Exception as e:
+            logger.warning(f"[Rank {self.rank}] Barrier reset failed: {e}")
+
     def signal_terminating(self) -> None:
         """Signal that this rank is terminating.
 

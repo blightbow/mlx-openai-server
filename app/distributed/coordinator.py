@@ -226,8 +226,11 @@ def run_worker_loop(
                 length = synced_all_sum(length_template, group, "token_length", oob=oob)
             except PeerTimeoutError:
                 # Idle timeout waiting for coordinator - this is normal when no
-                # requests are pending. Log at debug level and keep waiting.
+                # requests are pending. Reset barrier (broken after timeout) and
+                # keep waiting. Log at debug level.
                 logger.debug(f"[Rank {rank}] Idle, no requests from coordinator")
+                if oob is not None:
+                    oob.reset_barrier()
                 continue
             actual_length = int(length[0].item())
             logger.debug(f"[Rank {rank}] Received length: {actual_length}")

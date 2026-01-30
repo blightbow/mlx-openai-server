@@ -147,7 +147,7 @@ class RequestQueue:
                 
                 # Set the result
                 request.set_result(result)
-                logger.info(f"Request {request.request_id} processed in {processing_time:.2f}s")
+                logger.debug(f"Request {request.request_id} dequeued in {processing_time:.2f}s")
                 
             except asyncio.TimeoutError:
                 request.set_exception(TimeoutError(f"Request processing timed out after {self.timeout}s"))
