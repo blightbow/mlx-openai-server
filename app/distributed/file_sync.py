@@ -56,7 +56,7 @@ import mlx.core as mx
 import numpy as np
 from loguru import logger
 
-from .helpers import broadcast_value, synced_all_sum
+from .helpers import broadcast_value, synced_all_sum_sync
 
 
 # Safetensors dtype string -> (numpy dtype for raw bytes, mlx dtype, element size)
@@ -468,7 +468,7 @@ def broadcast_manifest(
     else:
         count = mx.zeros((1,), dtype=mx.int32)
 
-    count_result = synced_all_sum(count, group, "manifest_count")
+    count_result = synced_all_sum_sync(count, group, "manifest_count")
     file_count = int(count_result[0].item())
 
     if file_count == 0:
@@ -490,7 +490,7 @@ def broadcast_manifest(
         else:
             header = mx.zeros((2,), dtype=mx.int64)
 
-        header_result = synced_all_sum(header, group, f"manifest_header_{i}")
+        header_result = synced_all_sum_sync(header, group, f"manifest_header_{i}")
         name_len = int(header_result[0].item())
         file_size = int(header_result[1].item())
 
@@ -504,7 +504,7 @@ def broadcast_manifest(
         else:
             name_array = mx.zeros((MAX_FILENAME_LENGTH,), dtype=mx.uint8)
 
-        name_result = synced_all_sum(name_array, group, f"manifest_name_{i}")
+        name_result = synced_all_sum_sync(name_array, group, f"manifest_name_{i}")
 
         # Decode filename
         name_bytes = np.array(name_result[:name_len], copy=False).tobytes()
@@ -784,7 +784,7 @@ def broadcast_rank_assignments(
         size_array = mx.zeros((1,), dtype=mx.int64)
 
     # Broadcast size
-    size_result = synced_all_sum(size_array, group, "assignments_size")
+    size_result = synced_all_sum_sync(size_array, group, "assignments_size")
     data_size = int(size_result[0].item())
 
     if data_size == 0:
@@ -798,7 +798,7 @@ def broadcast_rank_assignments(
     else:
         data_array = mx.zeros((data_size,), dtype=mx.uint8)
 
-    data_result = synced_all_sum(data_array, group, "assignments_data")
+    data_result = synced_all_sum_sync(data_array, group, "assignments_data")
 
     # Deserialize
     data_bytes = np.array(data_result, copy=False).tobytes()
@@ -1290,7 +1290,7 @@ def broadcast_file_bytes(
     t_read = time.perf_counter()
 
     # Broadcast file size
-    size_result = synced_all_sum(size_array, group, "file_size")
+    size_result = synced_all_sum_sync(size_array, group, "file_size")
     file_size = int(size_result[0].item())
     del size_array, size_result
 
