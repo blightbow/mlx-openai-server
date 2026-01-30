@@ -41,6 +41,7 @@ dependencies = [
   "outlines>=1.1.1,<1.2",
   "pillow>=10.4.0,<11.0",
   "pydantic>=2,<3",
+  "pyzmq>=27.0.0,<28",
   "python-multipart>=0.0.20,<0.0.25",
   "rich>=14,<15",
   "torchvision>=0.23.0,<0.30",
@@ -53,6 +54,7 @@ dev = [
   "mypy",
   "pre-commit",
   "pytest",
+  "pytest-asyncio",
   "ruff",
   "types-aiofiles",
   "types-cffi",
@@ -95,6 +97,8 @@ quiet-level = 3
 
 [tool.pytest.ini_options]
 addopts = "--tb=short"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = [
   "integration: marks tests as integration tests that require external services",
 ]

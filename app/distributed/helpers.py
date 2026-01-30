@@ -1,8 +1,8 @@
-"""Synchronization helpers for JACCL collective operations.
+"""Async synchronization helpers for JACCL collective operations.
 
-This module provides helper functions that encapsulate the OOB barrier + all_sum
-pattern required for reliable JACCL operations. The key insight is that JACCL
-requires ranks to enter collective operations simultaneously - without OOB
+This module provides async helper functions that encapsulate the OOB barrier +
+all_sum pattern required for reliable JACCL operations. The key insight is that
+JACCL requires ranks to enter collective operations simultaneously - without OOB
 synchronization, RDMA operations can receive data from subsequent operations.
 
 Design Note: Why No CPU Stream Parameter
@@ -20,15 +20,17 @@ ensuring ranks enter collective operations together. We don't specify
 
 Usage Examples
 --------------
-Warmup synchronization (replaces 15 lines in main.py):
-    warmup = synced_all_sum(warmup_input, group, "warmup", oob=current_oob)
+Warmup synchronization:
+    warmup = await synced_all_sum(warmup_input, group, "warmup", oob=current_oob)
 
-Broadcast from rank 0 (replaces if/else pattern in file_sync.py):
-    count = broadcast_value(mx.array([len(files)]), rank, group, "file_count", oob)
+Broadcast from rank 0:
+    count = await broadcast_value(mx.array([len(files)]), rank, group, "file_count", oob)
 
 Termination-safe collective:
     try:
-        length = safe_collective(lambda: synced_all_sum(...), "token_length", oob)
+        length = await safe_collective(
+            lambda: synced_all_sum(...), "token_length", oob
+        )
     except PeerTerminatedError:
         return
 """
@@ -37,36 +39,28 @@ from typing import TYPE_CHECKING, Callable, Optional, TypeVar
 
 import mlx.core as mx
 
+# Import exceptions from oob module (single source of truth)
+from .oob import AbortError, PeerTerminatedError, PeerTimeoutError
+
 if TYPE_CHECKING:
     from .oob import OOBCoordinator
+
+# Re-export exceptions for backward compatibility
+__all__ = [
+    "PeerTerminatedError",
+    "PeerTimeoutError",
+    "AbortError",
+    "synced_all_sum",
+    "broadcast_value",
+    "safe_collective",
+    "synced_all_sum_sync",
+    "broadcast_value_sync",
+]
 
 R = TypeVar("R")
 
 
-class PeerTerminatedError(Exception):
-    """Raised when a peer has signaled termination during a collective operation.
-
-    This exception indicates that a distributed peer has signaled it is
-    terminating, and the collective operation should be aborted to prevent
-    RDMA operations against a dead peer.
-    """
-
-    pass
-
-
-class PeerTimeoutError(Exception):
-    """Raised when an OOB wait operation times out.
-
-    This exception indicates that an OOB coordination operation (barrier,
-    wait_ready, wait_complete) timed out waiting for a peer. This typically
-    means a peer has crashed or become unresponsive without signaling
-    termination.
-    """
-
-    pass
-
-
-def synced_all_sum(
+async def synced_all_sum(
     data: mx.array,
     group: mx.distributed.Group,
     barrier_name: str,
@@ -94,14 +88,14 @@ def synced_all_sum(
         regardless of what stream is requested (see jaccl.cpp:777-779).
     """
     if oob is not None:
-        oob.barrier(barrier_name)
+        await oob.barrier(barrier_name)
 
     result = mx.distributed.all_sum(data, group=group)
     mx.eval(result)
     return result
 
 
-def broadcast_value(
+async def broadcast_value(
     value: mx.array,
     rank: int,
     group: mx.distributed.Group,
@@ -128,7 +122,7 @@ def broadcast_value(
 
     Example:
         # Rank 0 broadcasts file count to all ranks
-        count = broadcast_value(
+        count = await broadcast_value(
             mx.array([len(files)]),
             rank=my_rank,
             group=group,
@@ -141,10 +135,10 @@ def broadcast_value(
     else:
         contribution = mx.zeros_like(value)
 
-    return synced_all_sum(contribution, group, barrier_name, oob)
+    return await synced_all_sum(contribution, group, barrier_name, oob)
 
 
-def safe_collective(
+async def safe_collective(
     collective_fn: Callable[[], R],
     barrier_name: str,
     oob: Optional["OOBCoordinator"] = None,
@@ -158,7 +152,7 @@ def safe_collective(
 
     Args:
         collective_fn: A callable that performs the collective operation.
-                       Typically a lambda wrapping synced_all_sum.
+                       Can be sync (for mx.eval patterns) or return awaitable.
         barrier_name: Name for logging (used if termination detected)
         oob: Optional OOB coordinator for termination checking
         raise_on_termination: If True (default), raises PeerTerminatedError
@@ -174,11 +168,12 @@ def safe_collective(
 
     Example:
         try:
-            result = safe_collective(
-                lambda: synced_all_sum(data, group, "sync", oob),
+            result = await safe_collective(
+                lambda: mx.distributed.all_sum(data, group=group),
                 "my_operation",
                 oob,
             )
+            mx.eval(result)
         except PeerTerminatedError:
             logger.info("Peer terminated, shutting down")
             return
@@ -203,3 +198,69 @@ def safe_collective(
         return None
 
     return result
+
+
+# Synchronous wrappers for non-async code paths (e.g., model forward pass)
+
+
+def synced_all_sum_sync(
+    data: mx.array,
+    group: mx.distributed.Group,
+    barrier_name: str,
+    oob: Optional["OOBCoordinator"] = None,
+    timeout: Optional[float] = None,
+) -> mx.array:
+    """Synchronous version of synced_all_sum for non-async code paths.
+
+    Uses oob_barrier_sync internally, which creates a new event loop if needed.
+    Prefer the async version where possible.
+
+    Args:
+        data: The array to sum across all ranks
+        group: The MLX distributed group for the operation
+        barrier_name: Name for the OOB barrier (for debugging/logging)
+        oob: Optional OOB coordinator for synchronization
+        timeout: Optional timeout override for the barrier
+
+    Returns:
+        The result of all_sum, evaluated to ensure completion
+    """
+    if oob is not None:
+        from .oob import oob_barrier_sync
+
+        oob_barrier_sync(barrier_name, timeout)
+
+    result = mx.distributed.all_sum(data, group=group)
+    mx.eval(result)
+    return result
+
+
+def broadcast_value_sync(
+    value: mx.array,
+    rank: int,
+    group: mx.distributed.Group,
+    barrier_name: str,
+    oob: Optional["OOBCoordinator"] = None,
+    source_rank: int = 0,
+    timeout: Optional[float] = None,
+) -> mx.array:
+    """Synchronous version of broadcast_value for non-async code paths.
+
+    Args:
+        value: The array to broadcast (only used if rank == source_rank)
+        rank: This process's rank
+        group: The MLX distributed group for the operation
+        barrier_name: Name for the OOB barrier (for debugging/logging)
+        oob: Optional OOB coordinator for synchronization
+        source_rank: The rank that contributes the value (default: 0)
+        timeout: Optional timeout override for the barrier
+
+    Returns:
+        The broadcast value on all ranks
+    """
+    if rank == source_rank:
+        contribution = value
+    else:
+        contribution = mx.zeros_like(value)
+
+    return synced_all_sum_sync(contribution, group, barrier_name, oob, timeout)

@@ -1,124 +1,157 @@
-"""Out-of-band coordination for JACCL send/recv rendezvous.
+"""Out-of-band coordination for JACCL send/recv rendezvous using ZeroMQ.
 
-This module provides rendezvous primitives for JACCL's RDMA data plane.
-It solves the timing asymmetry problem that causes SIGBUS crashes when
-using mx.distributed.send/recv over JACCL.
+This module provides rendezvous primitives for JACCL's RDMA data plane using
+ZeroMQ (pyzmq) sockets. It solves the timing asymmetry problem that causes
+SIGBUS crashes when using mx.distributed.send/recv over JACCL.
 
 IMPORTANT: This module is JACCL-specific. Ring backend doesn't need OOB
 (neighbor-only send/recv with implicit sync). MPI has built-in rendezvous.
 For non-JACCL backends, skip OOB initialization entirely.
 
-The Problem:
-    JACCL's send/recv lacks MPI's rendezvous protocol. When sender and receiver
-    have asymmetric timing (e.g., receiver waiting, sender not ready), RDMA
-    operations fail with GPU timeout or SIGBUS.
+Architecture:
+    ZeroMQ provides socket patterns for coordination:
+    - REQ/REP: Barrier arrivals (count-based, immediate release)
+    - REQ/REP: Key-value store operations
+    - PUB/SUB: Broadcast (barrier release, termination, abort)
 
-The Solution:
-    Use Python's multiprocessing.managers as an out-of-band signaling channel:
-    - Receiver signals "ready" via shared dict
-    - Sender polls for ready signal, then sends via JACCL
-    - Native Barrier synchronizes ranks between transfer phases
-    - Natural backpressure, no timing issues
+    All operations are async-first, cancellable via asyncio.CancelledError.
 
-This is the standard "receiver-initiated rendezvous" pattern used in MPI
-implementations, but using BaseManager instead of MPI's internal protocols.
+Socket Topology:
+    Rank 0 (Coordinator):
+      - REP socket: tcp://0.0.0.0:29400 (bind) - barrier arrivals
+      - REP socket: tcp://0.0.0.0:29401 (bind) - store operations
+      - REP socket: tcp://0.0.0.0:29402 (bind) - termination relay
+      - PUB socket: tcp://0.0.0.0:29403 (bind) - broadcast
 
-Why not PyTorch TCPStore?
-    TCPStore has unfixable IPv6 socket issues on macOS causing 35-80+ second
-    initialization delays. The root cause is in PyTorch's C++ socket code
-    (getaddrinfo called with nullptr), and macOS distributed support is
-    explicitly unmaintained (see PyTorch Issue #148440).
+    Workers (Rank 1+):
+      - REQ socket: tcp://{host}:29400 (connect) - barrier
+      - REQ socket: tcp://{host}:29401 (connect) - store
+      - REQ socket: tcp://{host}:29402 (connect) - termination
+      - SUB socket: tcp://{host}:29403 (connect) - broadcast
 
-    Python's multiprocessing.managers uses explicit IPv4 sockets when given
-    a tuple address, avoiding this issue entirely.
-
-Startup Coordination:
-    OOB initialization can happen BEFORE mx.distributed.init(). Workers retry
-    connecting to rank 0's manager with exponential backoff. Once connected,
-    rank 0 is guaranteed to be ready, making JACCL init safe.
+Why ZeroMQ over pynng?
+    Research showed pynng has ~10µs jitter vs ZeroMQ's ~1µs. Given JACCL RDMA
+    latency of 5-9µs, pynng's jitter is comparable to RDMA operation time itself.
+    Additionally, pynng's SURVEY pattern is time-based (waits for timeout) while
+    ZeroMQ's REQ/REP enables count-based barriers (immediate release when all
+    ranks arrive).
 
 Usage:
-    # Initialize on all ranks (workers will retry until rank 0 is ready)
-    oob = OOBCoordinator(rank, world_size, coordinator_ip, port, authkey)
+    # Initialize on all ranks (async context required)
+    async with OOBCoordinator(rank, world_size, coordinator_ip, port) as oob:
+        # Barrier synchronization
+        await oob.barrier("phase_name")
 
-    # Receiver-initiated transfer
-    if rank == receiver:
-        oob.signal_ready(transfer_id)
-        data = mx.distributed.recv_like(template, src=sender, group=jaccl_group)
-    elif rank == sender:
-        oob.wait_ready(transfer_id, receiver)
-        mx.distributed.send(data, dst=receiver, group=jaccl_group)
-
-    # Barrier between transfer phases
-    oob.barrier("phase_name")
+        # Receiver-initiated transfer
+        if rank == receiver:
+            await oob.signal_ready(transfer_id)
+            data = mx.distributed.recv_like(template, src=sender, group=jaccl_group)
+        elif rank == sender:
+            await oob.wait_ready(transfer_id, receiver)
+            mx.distributed.send(data, dst=receiver, group=jaccl_group)
 """
 
+import asyncio
 import os
-import random
-import threading
 import time
-from multiprocessing.managers import BaseManager, BarrierProxy, DictProxy
-from typing import Optional
+from typing import Optional, Set
 
+import zmq
+import zmq.asyncio
 from loguru import logger
 
-# Module-level shared objects (only rank 0's process uses these directly;
-# other ranks access them via manager proxies)
-_shared_store: dict = {}
-_shared_barrier: Optional[threading.Barrier] = None
 
+class PeerTimeoutError(Exception):
+    """Raised when an OOB wait operation times out.
 
-class OOBManager(BaseManager):
-    """Custom manager for OOB coordination.
-
-    Provides shared dict and barrier accessible across network via proxies.
+    This exception indicates that an OOB coordination operation (barrier,
+    wait_ready, wait_complete) timed out waiting for a peer. This typically
+    means a peer has crashed or become unresponsive without signaling
+    termination.
     """
 
     pass
 
 
-# Register shared object accessors with explicit proxy types.
-# The callables return module-level objects; proxies expose their methods.
-OOBManager.register(
-    "get_store",
-    callable=lambda: _shared_store,
-    proxytype=DictProxy,
-    exposed=[
-        "__contains__",
-        "__delitem__",
-        "__getitem__",
-        "__setitem__",
-        "__len__",
-        "clear",
-        "get",
-        "items",
-        "keys",
-        "pop",
-        "update",
-        "values",
-    ],
-)
-OOBManager.register(
-    "get_barrier",
-    callable=lambda: _shared_barrier,
-    proxytype=BarrierProxy,
-    exposed=["wait", "abort", "reset", "parties", "n_waiting", "broken"],
-)
+class PeerTerminatedError(Exception):
+    """Raised when a peer has signaled termination during a collective operation.
+
+    This exception indicates that a distributed peer has signaled it is
+    terminating, and the collective operation should be aborted to prevent
+    RDMA operations against a dead peer.
+    """
+
+    pass
+
+
+class AbortError(Exception):
+    """Raised when an abort signal is received.
+
+    This exception indicates that an external abort signal was broadcast,
+    and all pending operations should terminate.
+    """
+
+    pass
+
+
+class BarrierHandle:
+    """Handle for non-blocking barrier completion tracking (Ibarrier pattern).
+
+    This allows checking barrier completion without blocking, similar to
+    MPI_Ibarrier + MPI_Test pattern.
+    """
+
+    def __init__(self) -> None:
+        """Initialize barrier handle."""
+        self._complete = False
+        self._event = asyncio.Event()
+        self._cancelled = False
+
+    def is_complete(self) -> bool:
+        """Non-blocking check if all ranks arrived.
+
+        Returns:
+            True if all ranks have arrived at the barrier
+        """
+        return self._complete
+
+    async def wait(self, timeout: Optional[float] = None) -> None:
+        """Wait for barrier completion.
+
+        Args:
+            timeout: Timeout in seconds, or None for no timeout
+
+        Raises:
+            PeerTimeoutError: If timeout expires before completion
+            asyncio.CancelledError: If wait is cancelled
+        """
+        if self._complete:
+            return
+
+        try:
+            await asyncio.wait_for(self._event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise PeerTimeoutError(f"Barrier wait timed out after {timeout}s") from None
+
+    def cancel(self) -> None:
+        """Cancel waiting - barrier remains usable for others."""
+        self._cancelled = True
+
+    def _mark_complete(self) -> None:
+        """Mark barrier as complete (called by coordinator)."""
+        self._complete = True
+        self._event.set()
 
 
 class OOBCoordinator:
-    """Out-of-band coordinator for JACCL send/recv rendezvous.
+    """ZeroMQ-based async OOB coordinator for JACCL.
 
-    Provides rendezvous primitives (signal_ready, wait_ready, barrier) that
-    work alongside JACCL's RDMA data plane. All coordination happens over TCP,
-    completely separate from the RDMA path.
+    Uses socket patterns:
+    - REQ/REP for barrier (count-based immediate release)
+    - REQ/REP for key-value store
+    - PUB/SUB for broadcast (barrier release, termination, abort)
 
-    This coordinator is JACCL-specific. Do not initialize for other backends:
-    - Ring: Uses neighbor-only send/recv with implicit synchronization
-    - MPI: Has built-in rendezvous protocol
-
-    Uses Python's multiprocessing.managers for cross-process communication,
-    which creates explicit IPv4 sockets (avoiding PyTorch's IPv6 issues).
+    All operations are async. Cancellable via asyncio.CancelledError.
     """
 
     def __init__(
@@ -127,156 +160,443 @@ class OOBCoordinator:
         world_size: int,
         host: str,
         port: int = 29400,
-        authkey: bytes = b"oob",
         timeout_sec: float = 300.0,
-        connect_timeout_sec: float = 300.0,
-    ):
+    ) -> None:
         """Initialize the OOB coordinator.
 
-        For rank 0 (master), this starts the manager server in a background
-        thread. For workers (rank > 0), this retries connecting to the master
-        with exponential backoff until successful or connect_timeout_sec is
-        reached.
-
-        This allows workers to start before rank 0 - they will simply wait
-        until rank 0 is ready, making startup order-independent.
+        Note: Call start() or use as async context manager to begin operation.
 
         Args:
             rank: This process's rank (0 = coordinator/master)
             world_size: Total number of processes
             host: IP/hostname of the coordinator (rank 0)
-            port: TCP port for the manager (default: 29400)
-            authkey: Authentication key for manager connections. All ranks must
-                use the same key. See derive_authkey() for cluster-specific keys.
-            timeout_sec: Timeout for operations in seconds (default: 300)
-            connect_timeout_sec: Timeout for initial connection attempts (default: 300)
+            port: Base TCP port for sockets (default: 29400)
+                  Uses port, port+1, port+2, port+3 for barrier, store, term, broadcast
+            timeout_sec: Default timeout for operations (default: 300)
         """
-        global _shared_store, _shared_barrier
-
         self.rank = rank
         self.world_size = world_size
         self.host = host
         self.port = port
         self._timeout_sec = timeout_sec
 
+        # ZeroMQ context and sockets (created in start())
+        self._ctx: Optional[zmq.asyncio.Context] = None
+
+        # Coordinator sockets (rank 0 only)
+        self._barrier_rep: Optional[zmq.asyncio.Socket] = None
+        self._store_rep: Optional[zmq.asyncio.Socket] = None
+        self._term_rep: Optional[zmq.asyncio.Socket] = None
+        self._pub: Optional[zmq.asyncio.Socket] = None
+
+        # Worker sockets (all ranks)
+        self._barrier_req: Optional[zmq.asyncio.Socket] = None
+        self._store_req: Optional[zmq.asyncio.Socket] = None
+        self._term_req: Optional[zmq.asyncio.Socket] = None
+        self._sub: Optional[zmq.asyncio.Socket] = None
+
+        # State
+        self._store: dict[str, str] = {}
+        self._terminating_ranks: Set[int] = set()
+        self._abort_flag = False
+        self._shutdown = False
+
+        # Background tasks
+        self._tasks: list[asyncio.Task[None]] = []
+
+        # Barrier state for coordinator
+        self._barrier_waiters: dict[str, list[bytes]] = {}  # name -> list of rank identities
+        self._barrier_events: dict[str, asyncio.Event] = {}
+
         logger.info(
-            f"[Rank {rank}] Initializing OOB coordinator "
-            f"({'server' if rank == 0 else 'client'}) -> {host}:{port}"
+            f"[Rank {rank}] OOB coordinator created "
+            f"(host={host}, port={port}, world_size={world_size})"
         )
 
-        if rank == 0:
-            # Initialize shared objects BEFORE starting server.
-            # These live in rank 0's process memory; the manager provides
-            # proxies to other ranks.
-            _shared_store = {}
-            _shared_barrier = threading.Barrier(world_size)
+    async def __aenter__(self) -> "OOBCoordinator":
+        """Async context manager entry."""
+        await self.start()
+        return self
 
-            # Create manager and run server in background thread.
-            # Using get_server().serve_forever() instead of start() keeps the
-            # server in our process (not spawned), so lambda callables can
-            # access the module-level shared objects.
-            self._server_manager = OOBManager(
-                address=("0.0.0.0", port), authkey=authkey
-            )
-            server = self._server_manager.get_server()
-            self._server_thread = threading.Thread(
-                target=server.serve_forever, daemon=True
-            )
-            self._server_thread.start()
-            logger.info(f"[Rank {rank}] OOB server started on port {port}")
+    async def __aexit__(
+        self,
+        exc_type: Optional[type],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[object],
+    ) -> None:
+        """Async context manager exit."""
+        await self.stop()
 
-            # Small delay to ensure server is listening before we connect
-            time.sleep(0.05)
+    async def start(self) -> None:
+        """Start the OOB coordinator.
 
-        # ALL ranks (including rank 0) connect as clients.
-        # This provides a uniform code path for accessing shared objects.
-        if rank == 0:
-            # Rank 0 connects to localhost (its own server)
-            self._manager = OOBManager(address=("127.0.0.1", port), authkey=authkey)
-            self._manager.connect()
-        else:
-            # Workers connect to rank 0's server with retry
-            self._manager = OOBManager(address=(host, port), authkey=authkey)
-            self._connect_with_retry(connect_timeout_sec)
-
-        # Get proxies to the shared objects (same objects for all ranks)
-        t0 = time.time()
-        self._store = self._manager.get_store()
-        self._barrier = self._manager.get_barrier()
-        logger.debug(f"[Rank {rank}] Got proxies in {time.time() - t0:.3f}s")
-
-        # Synchronize all ranks before returning
-        logger.info(f"[Rank {rank}] OOB connected, waiting for all ranks...")
-        t0 = time.time()
-        self._barrier.wait()
-        logger.info(
-            f"[Rank {rank}] OOB coordinator initialized (barrier took {time.time()-t0:.2f}s)"
-        )
-
-    def _connect_with_retry(self, connect_timeout_sec: float) -> None:
-        """Connect to manager server with exponential backoff.
-
-        Uses jittered exponential backoff to avoid thundering herd when
-        multiple workers start simultaneously before rank 0.
-
-        Args:
-            connect_timeout_sec: Total time to spend retrying connection
-
-        Raises:
-            TimeoutError: If unable to connect within connect_timeout_sec
+        Creates sockets and starts background tasks.
         """
-        logger.info(
-            f"[Rank {self.rank}] Connecting to OOB server at {self.host}:{self.port} "
-            f"(timeout={connect_timeout_sec}s)..."
-        )
-        deadline = time.time() + connect_timeout_sec
-        base_interval = 0.5  # Start with 500ms
-        max_interval = 10.0  # Cap at 10s
-        attempt = 0
-        warned = False
+        logger.info(f"[Rank {self.rank}] Starting OOB coordinator...")
 
-        while time.time() < deadline:
-            try:
-                self._manager.connect()
-                if attempt > 0:
-                    logger.info(
-                        f"[Rank {self.rank}] Connected to OOB server after {attempt} retries"
-                    )
-                return
+        self._ctx = zmq.asyncio.Context()
 
-            except Exception as e:
-                attempt += 1
-                remaining = deadline - time.time()
+        if self.rank == 0:
+            await self._start_coordinator()
+        else:
+            await self._start_worker()
 
-                if not warned:
-                    # First failure: warn user that we're waiting for rank 0
-                    logger.warning(
-                        f"[Rank {self.rank}] Cannot reach OOB server at {self.host}:{self.port} "
-                        f"({e.__class__.__name__}). Waiting for rank 0 to start..."
-                    )
-                    warned = True
+        # All ranks subscribe to broadcast
+        await self._start_subscriber()
 
-                if remaining <= 0:
+        # Start background tasks
+        if self.rank == 0:
+            self._tasks.append(asyncio.create_task(self._barrier_server_loop()))
+            self._tasks.append(asyncio.create_task(self._store_server_loop()))
+            self._tasks.append(asyncio.create_task(self._term_relay_loop()))
+
+        self._tasks.append(asyncio.create_task(self._broadcast_listener()))
+
+        # Wait for all ranks to connect (simple barrier via store)
+        await self._startup_barrier()
+
+        logger.info(f"[Rank {self.rank}] OOB coordinator started")
+
+    async def _start_coordinator(self) -> None:
+        """Start coordinator sockets (rank 0 only)."""
+        # Barrier arrivals (REP)
+        self._barrier_rep = self._ctx.socket(zmq.REP)
+        self._configure_socket(self._barrier_rep)
+        self._barrier_rep.bind(f"tcp://0.0.0.0:{self.port}")
+
+        # Store operations (REP)
+        self._store_rep = self._ctx.socket(zmq.REP)
+        self._configure_socket(self._store_rep)
+        self._store_rep.bind(f"tcp://0.0.0.0:{self.port + 1}")
+
+        # Termination relay (REP)
+        self._term_rep = self._ctx.socket(zmq.REP)
+        self._configure_socket(self._term_rep)
+        self._term_rep.bind(f"tcp://0.0.0.0:{self.port + 2}")
+
+        # Broadcast (PUB)
+        self._pub = self._ctx.socket(zmq.PUB)
+        self._configure_socket(self._pub)
+        self._pub.bind(f"tcp://0.0.0.0:{self.port + 3}")
+
+        logger.debug(f"[Rank 0] Coordinator sockets bound on ports {self.port}-{self.port + 3}")
+
+    async def _start_worker(self) -> None:
+        """Start worker sockets (rank > 0)."""
+        # Barrier (REQ)
+        self._barrier_req = self._ctx.socket(zmq.REQ)
+        self._configure_socket(self._barrier_req)
+        self._barrier_req.connect(f"tcp://{self.host}:{self.port}")
+
+        # Store (REQ)
+        self._store_req = self._ctx.socket(zmq.REQ)
+        self._configure_socket(self._store_req)
+        self._store_req.connect(f"tcp://{self.host}:{self.port + 1}")
+
+        # Termination (REQ)
+        self._term_req = self._ctx.socket(zmq.REQ)
+        self._configure_socket(self._term_req)
+        self._term_req.connect(f"tcp://{self.host}:{self.port + 2}")
+
+        logger.debug(f"[Rank {self.rank}] Worker sockets connected to {self.host}:{self.port}")
+
+    async def _start_subscriber(self) -> None:
+        """Start broadcast subscriber (all ranks)."""
+        self._sub = self._ctx.socket(zmq.SUB)
+        self._configure_socket(self._sub)
+
+        # Subscribe to all messages
+        self._sub.setsockopt(zmq.SUBSCRIBE, b"")
+
+        if self.rank == 0:
+            # Rank 0 connects to its own publisher via localhost
+            self._sub.connect(f"tcp://127.0.0.1:{self.port + 3}")
+        else:
+            self._sub.connect(f"tcp://{self.host}:{self.port + 3}")
+
+        logger.debug(f"[Rank {self.rank}] Subscribed to broadcast")
+
+    def _configure_socket(self, sock: zmq.asyncio.Socket) -> None:
+        """Configure socket for low latency and graceful shutdown."""
+        # Bounded graceful shutdown (100ms max wait)
+        sock.setsockopt(zmq.LINGER, 100)
+
+        # Don't buffer to incomplete connections
+        sock.setsockopt(zmq.IMMEDIATE, 1)
+
+        # Small buffers for latency over throughput
+        sock.setsockopt(zmq.SNDBUF, 4096)
+        sock.setsockopt(zmq.RCVBUF, 4096)
+
+    async def _startup_barrier(self) -> None:
+        """Simple startup synchronization using store."""
+        key = f"startup_rank{self.rank}"
+
+        # Signal our presence
+        await self._store_set(key, "1")
+
+        # Wait for all ranks
+        deadline = time.time() + self._timeout_sec
+        while True:
+            all_present = True
+            for r in range(self.world_size):
+                if not await self._store_exists(f"startup_rank{r}"):
+                    all_present = False
                     break
 
-                # Exponential backoff with jitter to avoid thundering herd
-                # Jitter: randomize between 50-100% of the interval
-                interval = min(base_interval * (2 ** min(attempt, 6)), max_interval)
-                jittered = interval * (0.5 + random.random() * 0.5)
-                sleep_time = min(jittered, remaining)
+            if all_present:
+                break
 
-                logger.debug(
-                    f"[Rank {self.rank}] Retry {attempt} in {sleep_time:.1f}s "
-                    f"({remaining:.0f}s remaining)"
+            if time.time() >= deadline:
+                raise PeerTimeoutError(
+                    f"[Rank {self.rank}] Startup barrier timed out after {self._timeout_sec}s"
                 )
-                time.sleep(sleep_time)
 
-        raise TimeoutError(
-            f"[Rank {self.rank}] Could not connect to OOB server at {self.host}:{self.port} "
-            f"after {connect_timeout_sec}s. Is rank 0 running?"
-        )
+            await asyncio.sleep(0.01)
 
-    def signal_ready(self, transfer_id: str) -> None:
+        logger.debug(f"[Rank {self.rank}] Startup barrier passed")
+
+    async def stop(self) -> None:
+        """Stop the OOB coordinator gracefully."""
+        logger.info(f"[Rank {self.rank}] Stopping OOB coordinator...")
+
+        self._shutdown = True
+
+        # Cancel background tasks
+        for task in self._tasks:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        self._tasks.clear()
+
+        # Close sockets
+        sockets = [
+            self._barrier_rep,
+            self._store_rep,
+            self._term_rep,
+            self._pub,
+            self._barrier_req,
+            self._store_req,
+            self._term_req,
+            self._sub,
+        ]
+
+        for sock in sockets:
+            if sock is not None:
+                sock.close()
+
+        # Terminate context
+        if self._ctx is not None:
+            self._ctx.term()
+            self._ctx = None
+
+        logger.info(f"[Rank {self.rank}] OOB coordinator stopped")
+
+    # --- Barrier (Count-based with broadcast release) ---
+
+    async def barrier(self, name: str, timeout: Optional[float] = None) -> None:
+        """Synchronize all ranks with count-based barrier.
+
+        Unlike time-based barriers (pynng SURVEY), this releases immediately
+        when all ranks arrive, providing ~1µs jitter instead of ~10µs.
+
+        Args:
+            name: Barrier name for debugging
+            timeout: Timeout in seconds (default: self._timeout_sec)
+
+        Raises:
+            PeerTimeoutError: If timeout expires before all ranks arrive
+            PeerTerminatedError: If peer signals termination
+            AbortError: If abort signal received
+        """
+        if timeout is None:
+            timeout = self._timeout_sec
+
+        self._check_abort_or_termination(f"barrier {name}")
+
+        logger.debug(f"[Rank {self.rank}] Entering barrier '{name}' (timeout={timeout}s)")
+
+        if self.rank == 0:
+            await self._barrier_coordinator(name, timeout)
+        else:
+            await self._barrier_worker(name, timeout)
+
+        logger.debug(f"[Rank {self.rank}] Passed barrier '{name}'")
+
+    async def _barrier_coordinator(self, name: str, timeout: float) -> None:
+        """Coordinator side of barrier - collect arrivals and broadcast release."""
+        # Coordinator counts as arrived
+        arrived = 1
+        needed = self.world_size
+
+        deadline = time.time() + timeout
+
+        # Wait for all workers to arrive
+        while arrived < needed:
+            self._check_abort_or_termination(f"barrier {name}")
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise PeerTimeoutError(
+                    f"[Rank 0] Barrier '{name}' timed out after {timeout}s "
+                    f"({arrived}/{needed} arrived)"
+                )
+
+            # The barrier server loop handles arrivals and signals us
+            await asyncio.sleep(0.001)
+
+            # Check how many arrived for this barrier
+            arrived = 1 + len(self._barrier_waiters.get(name, []))
+
+        # All arrived - broadcast release
+        release_msg = f"RELEASE:{name}".encode()
+        await self._pub.send(release_msg)
+        logger.debug(f"[Rank 0] Barrier '{name}' released ({needed} ranks)")
+
+        # Clean up
+        self._barrier_waiters.pop(name, None)
+
+    async def _barrier_worker(self, name: str, timeout: float) -> None:
+        """Worker side of barrier - signal arrival and wait for release."""
+        # Signal arrival to coordinator
+        arrival_msg = f"ARRIVE:{name}:{self.rank}".encode()
+
+        try:
+            await asyncio.wait_for(self._barrier_req.send(arrival_msg), timeout=timeout)
+            await asyncio.wait_for(self._barrier_req.recv(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise PeerTimeoutError(
+                f"[Rank {self.rank}] Barrier '{name}' arrival timeout after {timeout}s"
+            ) from None
+
+        # Wait for broadcast release
+        deadline = time.time() + timeout
+        release_msg = f"RELEASE:{name}".encode()
+
+        while True:
+            self._check_abort_or_termination(f"barrier {name}")
+
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise PeerTimeoutError(
+                    f"[Rank {self.rank}] Barrier '{name}' release timeout after {timeout}s"
+                )
+
+            # Check if we received the release (set by broadcast listener)
+            if name in self._barrier_events and self._barrier_events[name].is_set():
+                self._barrier_events.pop(name, None)
+                return
+
+            await asyncio.sleep(0.001)
+
+    async def _barrier_server_loop(self) -> None:
+        """Coordinator: Handle barrier arrival requests."""
+        while not self._shutdown:
+            try:
+                msg = await asyncio.wait_for(self._barrier_rep.recv(), timeout=0.1)
+                parts = msg.decode().split(":")
+
+                if parts[0] == "ARRIVE" and len(parts) >= 3:
+                    name = parts[1]
+                    rank = int(parts[2])
+
+                    if name not in self._barrier_waiters:
+                        self._barrier_waiters[name] = []
+                    self._barrier_waiters[name].append(rank)
+
+                    # Acknowledge arrival
+                    await self._barrier_rep.send(b"OK")
+                    logger.debug(
+                        f"[Rank 0] Barrier '{name}': rank {rank} arrived "
+                        f"({len(self._barrier_waiters[name]) + 1}/{self.world_size})"
+                    )
+                else:
+                    await self._barrier_rep.send(b"ERR:UNKNOWN")
+
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not self._shutdown:
+                    logger.error(f"[Rank 0] Barrier server error: {e}")
+
+    # --- Store Operations (REQ/REP pattern) ---
+
+    async def _store_server_loop(self) -> None:
+        """Coordinator: Handle store requests from workers."""
+        while not self._shutdown:
+            try:
+                msg = await asyncio.wait_for(self._store_rep.recv(), timeout=0.1)
+                parts = msg.decode().split(":", 2)
+                cmd = parts[0]
+
+                if cmd == "SET" and len(parts) >= 3:
+                    key, value = parts[1], parts[2]
+                    self._store[key] = value
+                    await self._store_rep.send(b"OK")
+
+                elif cmd == "GET" and len(parts) >= 2:
+                    key = parts[1]
+                    value = self._store.get(key, "")
+                    await self._store_rep.send(value.encode())
+
+                elif cmd == "EXISTS" and len(parts) >= 2:
+                    key = parts[1]
+                    exists = b"1" if key in self._store else b"0"
+                    await self._store_rep.send(exists)
+
+                elif cmd == "DEL" and len(parts) >= 2:
+                    key = parts[1]
+                    self._store.pop(key, None)
+                    await self._store_rep.send(b"OK")
+
+                else:
+                    await self._store_rep.send(b"ERR:UNKNOWN")
+
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not self._shutdown:
+                    logger.error(f"[Rank 0] Store server error: {e}")
+
+    async def _store_set(self, key: str, value: str) -> None:
+        """Set a key in the store."""
+        if self.rank == 0:
+            self._store[key] = value
+        else:
+            msg = f"SET:{key}:{value}".encode()
+            await self._store_req.send(msg)
+            await self._store_req.recv()
+
+    async def _store_get(self, key: str) -> str:
+        """Get a value from the store."""
+        if self.rank == 0:
+            return self._store.get(key, "")
+        else:
+            msg = f"GET:{key}".encode()
+            await self._store_req.send(msg)
+            data = await self._store_req.recv()
+            return data.decode()
+
+    async def _store_exists(self, key: str) -> bool:
+        """Check if a key exists in the store."""
+        if self.rank == 0:
+            return key in self._store
+        else:
+            msg = f"EXISTS:{key}".encode()
+            await self._store_req.send(msg)
+            data = await self._store_req.recv()
+            return data == b"1"
+
+    # --- Ready/Complete Signaling ---
+
+    async def signal_ready(self, transfer_id: str) -> None:
         """Signal that this rank is ready to receive a transfer.
 
         Call this BEFORE posting the JACCL recv operation.
@@ -285,11 +605,14 @@ class OOBCoordinator:
             transfer_id: Unique identifier for this transfer
         """
         key = f"ready_{transfer_id}_rank{self.rank}"
-        self._store[key] = "1"
+        await self._store_set(key, "1")
         logger.debug(f"[Rank {self.rank}] Signaled ready for transfer {transfer_id}")
 
-    def wait_ready(
-        self, transfer_id: str, receiver_rank: int, timeout: float = None
+    async def wait_ready(
+        self,
+        transfer_id: str,
+        receiver_rank: int,
+        timeout: Optional[float] = None,
     ) -> None:
         """Wait for a receiver to signal ready.
 
@@ -303,9 +626,8 @@ class OOBCoordinator:
         Raises:
             PeerTimeoutError: If timeout expires before receiver signals ready
             PeerTerminatedError: If peer signals termination during wait
+            AbortError: If abort signal received
         """
-        from .helpers import PeerTerminatedError, PeerTimeoutError
-
         if timeout is None:
             timeout = self._timeout_sec
 
@@ -318,28 +640,22 @@ class OOBCoordinator:
         deadline = time.time() + timeout
         poll_interval = 0.01  # 10ms between checks
 
-        while key not in self._store:
-            # Check for peer termination
-            if self.is_any_peer_terminating():
-                raise PeerTerminatedError(
-                    f"[Rank {self.rank}] Peer terminated while waiting for "
-                    f"rank {receiver_rank} ready signal for {transfer_id}"
-                )
+        while not await self._store_exists(key):
+            self._check_abort_or_termination(f"wait_ready {transfer_id}")
 
-            # Check timeout
             if time.time() >= deadline:
                 raise PeerTimeoutError(
                     f"[Rank {self.rank}] Timeout ({timeout}s) waiting for "
                     f"rank {receiver_rank} ready signal for {transfer_id}"
                 )
 
-            time.sleep(poll_interval)
+            await asyncio.sleep(poll_interval)
 
         logger.debug(
             f"[Rank {self.rank}] Rank {receiver_rank} is ready for transfer {transfer_id}"
         )
 
-    def signal_complete(self, transfer_id: str) -> None:
+    async def signal_complete(self, transfer_id: str) -> None:
         """Signal that a transfer has completed.
 
         Optional - use if sender needs to know when receiver has finished.
@@ -348,11 +664,14 @@ class OOBCoordinator:
             transfer_id: Unique identifier for this transfer
         """
         key = f"complete_{transfer_id}_rank{self.rank}"
-        self._store[key] = "1"
+        await self._store_set(key, "1")
         logger.debug(f"[Rank {self.rank}] Signaled complete for transfer {transfer_id}")
 
-    def wait_complete(
-        self, transfer_id: str, sender_rank: int, timeout: float = None
+    async def wait_complete(
+        self,
+        transfer_id: str,
+        sender_rank: int,
+        timeout: Optional[float] = None,
     ) -> None:
         """Wait for a transfer to complete.
 
@@ -364,9 +683,8 @@ class OOBCoordinator:
         Raises:
             PeerTimeoutError: If timeout expires before sender signals complete
             PeerTerminatedError: If peer signals termination during wait
+            AbortError: If abort signal received
         """
-        from .helpers import PeerTerminatedError, PeerTimeoutError
-
         if timeout is None:
             timeout = self._timeout_sec
 
@@ -377,118 +695,125 @@ class OOBCoordinator:
         )
 
         deadline = time.time() + timeout
-        poll_interval = 0.01  # 10ms between checks
+        poll_interval = 0.01
 
-        while key not in self._store:
-            # Check for peer termination
-            if self.is_any_peer_terminating():
-                raise PeerTerminatedError(
-                    f"[Rank {self.rank}] Peer terminated while waiting for "
-                    f"rank {sender_rank} complete signal for {transfer_id}"
-                )
+        while not await self._store_exists(key):
+            self._check_abort_or_termination(f"wait_complete {transfer_id}")
 
-            # Check timeout
             if time.time() >= deadline:
                 raise PeerTimeoutError(
                     f"[Rank {self.rank}] Timeout ({timeout}s) waiting for "
                     f"rank {sender_rank} complete signal for {transfer_id}"
                 )
 
-            time.sleep(poll_interval)
+            await asyncio.sleep(poll_interval)
 
         logger.debug(
             f"[Rank {self.rank}] Rank {sender_rank} completed transfer {transfer_id}"
         )
 
-    def barrier(self, name: Optional[str] = None, timeout: float = None) -> None:
-        """Synchronize all ranks.
+    # --- Termination/Abort (PUB/SUB pattern) ---
 
-        All ranks must call this method. Blocks until all ranks have arrived.
+    async def _term_relay_loop(self) -> None:
+        """Coordinator: Relay termination signals from workers to broadcast."""
+        while not self._shutdown:
+            try:
+                msg = await asyncio.wait_for(self._term_rep.recv(), timeout=0.1)
 
-        Args:
-            name: Optional name for debugging
-            timeout: Timeout in seconds (default: self._timeout_sec)
+                if msg.startswith(b"TERM:"):
+                    # Relay to broadcast
+                    await self._pub.send(msg)
+                    await self._term_rep.send(b"OK")
+                else:
+                    await self._term_rep.send(b"ERR:UNKNOWN")
 
-        Raises:
-            PeerTimeoutError: If timeout expires before all ranks arrive
-            PeerTerminatedError: If peer signals termination (checked before barrier)
-        """
-        from .helpers import PeerTerminatedError, PeerTimeoutError
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not self._shutdown:
+                    logger.error(f"[Rank 0] Term relay error: {e}")
 
-        if timeout is None:
-            timeout = self._timeout_sec
+    async def _broadcast_listener(self) -> None:
+        """Listen for broadcast messages (barrier release, termination, abort)."""
+        while not self._shutdown:
+            try:
+                msg = await asyncio.wait_for(self._sub.recv(), timeout=0.1)
 
-        # Check for peer termination before entering barrier
-        # This reduces the window for TOCTOU but doesn't eliminate it entirely
-        if self.is_any_peer_terminating():
-            raise PeerTerminatedError(
-                f"[Rank {self.rank}] Peer terminated before barrier{f' {name}' if name else ''}"
-            )
+                if msg.startswith(b"RELEASE:"):
+                    # Barrier release
+                    name = msg.decode().split(":", 1)[1]
+                    if name not in self._barrier_events:
+                        self._barrier_events[name] = asyncio.Event()
+                    self._barrier_events[name].set()
 
-        logger.debug(
-            f"[Rank {self.rank}] Barrier{f' {name}' if name else ''}: "
-            f"waiting (timeout={timeout}s)"
-        )
+                elif msg.startswith(b"TERM:"):
+                    # Termination signal
+                    rank = int(msg.decode().split(":")[1])
+                    self._terminating_ranks.add(rank)
+                    logger.info(f"[Rank {self.rank}] Received termination from rank {rank}")
 
-        try:
-            # threading.Barrier.wait() accepts timeout and raises BrokenBarrierError on timeout
-            self._barrier.wait(timeout=timeout)
-        except threading.BrokenBarrierError as e:
-            # Check if it's a timeout or if barrier was broken
-            raise PeerTimeoutError(
-                f"[Rank {self.rank}] Barrier{f' {name}' if name else ''} "
-                f"timed out or broken after {timeout}s: {e}"
-            )
+                elif msg.startswith(b"ABORT"):
+                    # Abort signal
+                    self._abort_flag = True
+                    logger.warning(f"[Rank {self.rank}] Received abort signal")
 
-        logger.debug(f"[Rank {self.rank}] Barrier{f' {name}' if name else ''}: passed")
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not self._shutdown:
+                    logger.debug(f"[Rank {self.rank}] Broadcast listener: {e}")
 
-    def reset_barrier(self) -> None:
-        """Reset the barrier after a timeout or broken state.
-
-        Call this after catching PeerTimeoutError from a barrier wait to make
-        the barrier usable again. Python's threading.Barrier enters a broken
-        state after timeout and cannot be used until reset.
-
-        Important: Only call this when the barrier is broken (after timeout).
-        Calling reset() while other parties are waiting is undefined behavior.
-        """
-        try:
-            self._barrier.reset()
-            logger.debug(f"[Rank {self.rank}] Barrier reset")
-        except Exception as e:
-            logger.warning(f"[Rank {self.rank}] Barrier reset failed: {e}")
-
-    def signal_terminating(self) -> None:
+    async def signal_terminating(self) -> None:
         """Signal that this rank is terminating.
 
         Call this during shutdown to notify other ranks that they should stop
-        RDMA operations. This helps prevent corruption from one-sided operations
-        against a dead peer.
+        RDMA operations.
         """
-        key = f"terminating_rank{self.rank}"
+        msg = f"TERM:{self.rank}".encode()
+
         try:
-            self._store[key] = "1"
-            logger.info(f"[Rank {self.rank}] Signaled termination to peers via OOB")
+            if self.rank == 0:
+                # Coordinator broadcasts directly
+                await self._pub.send(msg)
+            else:
+                # Workers send to coordinator for relay
+                await self._term_req.send(msg)
+                await self._term_req.recv()
+
+            self._terminating_ranks.add(self.rank)
+            logger.info(f"[Rank {self.rank}] Signaled termination to peers")
+
         except Exception as e:
-            # Connection may already be broken during shutdown
             logger.debug(f"[Rank {self.rank}] Could not signal termination: {e}")
 
     def is_any_peer_terminating(self) -> bool:
-        """Check if any peer has signaled termination.
+        """Check if any peer has signaled termination (sync check).
 
         Returns:
             True if any other rank has signaled it is terminating
         """
-        try:
-            for r in range(self.world_size):
-                if r != self.rank:
-                    key = f"terminating_rank{r}"
-                    if key in self._store:
-                        return True
-            return False
-        except Exception:
-            # Connection may be broken
-            return True  # Assume terminating if we can't check
+        for r in self._terminating_ranks:
+            if r != self.rank:
+                return True
+        return False
+
+    async def abort(self) -> None:
+        """Broadcast abort. All pending ops raise AbortError."""
+        if self.rank == 0 and self._pub is not None:
+            await self._pub.send(b"ABORT")
+            self._abort_flag = True
+            logger.warning(f"[Rank {self.rank}] Broadcast abort signal")
+
+    def _check_abort_or_termination(self, operation: str) -> None:
+        """Check for abort/termination and raise appropriate exception."""
+        if self._abort_flag:
+            raise AbortError(f"Abort during {operation}")
+        if self.is_any_peer_terminating():
+            raise PeerTerminatedError(f"Peer terminated during {operation}")
 
     def check_peers_alive(self) -> bool:
         """Check if OOB connection is still alive.
@@ -496,24 +821,19 @@ class OOBCoordinator:
         Returns:
             True if connection appears healthy
         """
-        try:
-            # Simple connectivity check
-            _ = len(self._store)
-            return True
-        except Exception:
-            return False
+        return not self._shutdown and not self._abort_flag
 
 
 # Global OOB coordinator instance (initialized lazily)
 _oob_coordinator: Optional[OOBCoordinator] = None
+_oob_lock = asyncio.Lock()
 
 
-def init_oob(
+async def init_oob(
     rank: int,
     world_size: int,
     host: Optional[str] = None,
     port: int = 29400,
-    authkey: Optional[bytes] = None,
 ) -> OOBCoordinator:
     """Initialize the global OOB coordinator.
 
@@ -524,37 +844,42 @@ def init_oob(
         world_size: Total number of processes
         host: Coordinator IP/hostname. If None, reads from MLX_OOB_HOST
               or falls back to MLX_JACCL_COORDINATOR.
-        port: TCP port (default: 29400)
-        authkey: Authentication key. If None, uses b'oob' (suitable for
-                 isolated JACCL networks). Use derive_authkey() for
-                 cluster-specific keys when multiple clusters share a network.
+        port: Base TCP port (default: 29400)
 
     Returns:
         The initialized OOBCoordinator instance
     """
     global _oob_coordinator
 
-    if _oob_coordinator is not None:
-        logger.warning("[OOB] Coordinator already initialized, returning existing instance")
+    async with _oob_lock:
+        if _oob_coordinator is not None:
+            logger.warning("[OOB] Coordinator already initialized, returning existing instance")
+            return _oob_coordinator
+
+        # Determine host from environment if not provided
+        if host is None:
+            host = os.environ.get("MLX_OOB_HOST")
+            if host is None:
+                # Fall back to JACCL coordinator (format: "host:port")
+                jaccl_coord = os.environ.get("MLX_JACCL_COORDINATOR", "")
+                if ":" in jaccl_coord:
+                    host = jaccl_coord.split(":")[0]
+                else:
+                    host = jaccl_coord or "127.0.0.1"
+
+        _oob_coordinator = OOBCoordinator(rank, world_size, host, port)
+        await _oob_coordinator.start()
         return _oob_coordinator
 
-    # Determine host from environment if not provided
-    if host is None:
-        host = os.environ.get("MLX_OOB_HOST")
-        if host is None:
-            # Fall back to JACCL coordinator (format: "host:port")
-            jaccl_coord = os.environ.get("MLX_JACCL_COORDINATOR", "")
-            if ":" in jaccl_coord:
-                host = jaccl_coord.split(":")[0]
-            else:
-                host = jaccl_coord or "127.0.0.1"
 
-    # Default authkey if not provided
-    if authkey is None:
-        authkey = b"oob"
+async def shutdown_oob() -> None:
+    """Shutdown the global OOB coordinator."""
+    global _oob_coordinator
 
-    _oob_coordinator = OOBCoordinator(rank, world_size, host, port, authkey)
-    return _oob_coordinator
+    async with _oob_lock:
+        if _oob_coordinator is not None:
+            await _oob_coordinator.stop()
+            _oob_coordinator = None
 
 
 def get_oob() -> Optional[OOBCoordinator]:
@@ -566,12 +891,39 @@ def get_oob() -> Optional[OOBCoordinator]:
     return _oob_coordinator
 
 
-def oob_barrier(name: Optional[str] = None) -> None:
+async def oob_barrier(name: Optional[str] = None, timeout: Optional[float] = None) -> None:
     """Convenience function for barrier synchronization.
 
     Args:
         name: Optional barrier name for debugging
+        timeout: Optional timeout override
     """
     if _oob_coordinator is None:
         raise RuntimeError("OOB coordinator not initialized. Call init_oob() first.")
-    _oob_coordinator.barrier(name)
+    await _oob_coordinator.barrier(name or "unnamed", timeout)
+
+
+# Sync wrappers for compatibility with existing code paths
+def oob_barrier_sync(name: Optional[str] = None, timeout: Optional[float] = None) -> None:
+    """Synchronous barrier wrapper for non-async code paths.
+
+    Creates a new event loop if needed. Prefer async version where possible.
+
+    Args:
+        name: Optional barrier name
+        timeout: Optional timeout override
+    """
+    if _oob_coordinator is None:
+        raise RuntimeError("OOB coordinator not initialized. Call init_oob() first.")
+
+    try:
+        loop = asyncio.get_running_loop()
+        # Already in async context - this would deadlock
+        raise RuntimeError(
+            "oob_barrier_sync called from async context. Use 'await oob_barrier()' instead."
+        )
+    except RuntimeError as e:
+        if "no running event loop" not in str(e).lower():
+            raise
+        # No running loop - safe to use run
+        asyncio.run(_oob_coordinator.barrier(name or "unnamed", timeout))

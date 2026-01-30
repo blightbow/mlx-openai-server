@@ -80,8 +80,10 @@ def _oob_send(
     # Barrier ensures both sender and receiver are ready for this transfer.
     # The receiver will be at this same barrier point, about to post its
     # receive buffer. After the barrier, both sides proceed together.
+    from .oob import oob_barrier_sync
+
     try:
-        oob.barrier(f"xfer_{transfer_id}")
+        oob_barrier_sync(f"xfer_{transfer_id}")
     except Exception as e:
         logger.error(f"[Rank {oob.rank}] OOB barrier failed for send to {dst}: {e}")
         raise
@@ -118,8 +120,10 @@ def _oob_recv_like(
     # Barrier ensures both sender and receiver are ready for this transfer.
     # The sender will be at this same barrier point. After the barrier,
     # both sides proceed to their respective send/recv + eval together.
+    from .oob import oob_barrier_sync
+
     try:
-        oob.barrier(f"xfer_{transfer_id}")
+        oob_barrier_sync(f"xfer_{transfer_id}")
     except Exception as e:
         logger.error(f"[Rank {oob.rank}] OOB barrier failed for recv from {src}: {e}")
         raise

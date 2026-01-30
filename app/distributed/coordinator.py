@@ -59,7 +59,7 @@ from mlx_lm.generate import stream_generate
 from mlx_lm.models.cache import make_prompt_cache
 from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
-from .helpers import synced_all_sum
+from .helpers import synced_all_sum_sync
 
 # Maximum prompt tokens to support (padded for recv_like template)
 MAX_PROMPT_LENGTH = 32768
@@ -138,7 +138,7 @@ class DistributedCoordinator:
 
         # Broadcast token length (all_sum pattern: rank 0 data + worker zeros = data)
         length = mx.array([len(tokens)], dtype=mx.int32)
-        synced_all_sum(length, self.group, "token_length", oob=oob)
+        synced_all_sum_sync(length, self.group, "token_length", oob=oob)
 
         # Pad tokens to fixed size and broadcast
         padded = mx.zeros((MAX_PROMPT_LENGTH,), dtype=mx.int32)
@@ -148,7 +148,7 @@ class DistributedCoordinator:
         else:
             padded = token_array[:MAX_PROMPT_LENGTH]
 
-        synced_all_sum(padded, self.group, "tokens", oob=oob)
+        synced_all_sum_sync(padded, self.group, "tokens", oob=oob)
 
         # Broadcast generation parameters (use -1 for None seed to indicate random)
         params = mx.array(
@@ -164,7 +164,7 @@ class DistributedCoordinator:
             ],
             dtype=mx.float32,
         )
-        synced_all_sum(params, self.group, "params", oob=oob)
+        synced_all_sum_sync(params, self.group, "params", oob=oob)
 
         logger.debug(
             f"[Rank 0] Broadcast {len(tokens)} tokens to {self.size - 1} workers"
@@ -223,26 +223,24 @@ def run_worker_loop(
             # OOB barriers protect against JACCL timing issues under CPU saturation.
             logger.debug(f"[Rank {rank}] Waiting for token length...")
             try:
-                length = synced_all_sum(length_template, group, "token_length", oob=oob)
+                length = synced_all_sum_sync(length_template, group, "token_length", oob=oob)
             except PeerTimeoutError:
                 # Idle timeout waiting for coordinator - this is normal when no
-                # requests are pending. Reset barrier (broken after timeout) and
-                # keep waiting. Log at debug level.
+                # requests are pending. ZeroMQ barriers don't need reset (no broken
+                # state), just continue waiting.
                 logger.debug(f"[Rank {rank}] Idle, no requests from coordinator")
-                if oob is not None:
-                    oob.reset_barrier()
                 continue
             actual_length = int(length[0].item())
             logger.debug(f"[Rank {rank}] Received length: {actual_length}")
 
             # Receive padded tokens
             logger.debug(f"[Rank {rank}] Waiting for tokens...")
-            tokens = synced_all_sum(token_template, group, "tokens", oob=oob)
+            tokens = synced_all_sum_sync(token_template, group, "tokens", oob=oob)
             logger.debug(f"[Rank {rank}] Received tokens")
 
             # Receive generation parameters
             logger.debug(f"[Rank {rank}] Waiting for params...")
-            params = synced_all_sum(param_template, group, "params", oob=oob)
+            params = synced_all_sum_sync(param_template, group, "params", oob=oob)
             logger.debug(f"[Rank {rank}] Received params")
 
             # Extract parameters

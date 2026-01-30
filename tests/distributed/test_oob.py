@@ -1,286 +1,307 @@
-"""Unit tests for out-of-band coordination module.
+"""Unit tests for ZeroMQ-based out-of-band coordination module.
 
-Tests the BaseManager-based OOB coordinator which provides rendezvous
-primitives for JACCL send/recv operations. This replaced TCPStore due to
-unfixable IPv6 issues on macOS (see PyTorch Issue #148440).
+Tests the ZeroMQ-based OOB coordinator which provides async rendezvous
+primitives for JACCL send/recv operations.
 """
 
-import multiprocessing
-import threading
-import time
-from multiprocessing import Process
-from multiprocessing.managers import BaseManager, BarrierProxy, DictProxy
-from unittest.mock import patch
+import asyncio
 
 import pytest
 
-
-# --- Test fixtures using isolated manager to avoid port conflicts ---
-
-
-def _find_free_port() -> int:
-    """Find an available TCP port."""
-    import socket
-
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        s.listen(1)
-        return s.getsockname()[1]
-
-
-# --- Module-level worker functions for multiprocessing (must be picklable) ---
-
-
-def _rank1_store_barrier_worker(port: int) -> None:
-    """Rank 1 worker: Connect to server, set key, verify rank 0's key, barrier."""
-    time.sleep(0.2)  # Let rank 0 start first
-
-    from app.distributed.oob import OOBCoordinator
-
-    coord = OOBCoordinator(
-        rank=1,
-        world_size=2,
-        host="127.0.0.1",
-        port=port,
-        authkey=b"test",
-        timeout_sec=10.0,
-        connect_timeout_sec=10.0,
-    )
-
-    # Set our ready key
-    coord._store["rank1_ready"] = "1"
-
-    # Check we can see rank 0's key (should be visible)
-    _ = coord._store.get("rank0_ready")
-
-    # Barrier
-    coord.barrier("test_barrier")
-
-
-def _rank1_wait_ready_worker(port: int) -> None:
-    """Rank 1 worker: Connect and wait for rank 0's ready signal."""
-    time.sleep(0.1)  # Let rank 0 start
-
-    from app.distributed.oob import OOBCoordinator
-
-    coord = OOBCoordinator(
-        rank=1,
-        world_size=2,
-        host="127.0.0.1",
-        port=port,
-        authkey=b"test",
-    )
-
-    # This should block until rank 0 signals
-    coord.wait_ready("transfer_test", receiver_rank=0)
-
-    coord._store["rank1_done"] = "1"
+from app.distributed.oob import (
+    AbortError,
+    BarrierHandle,
+    OOBCoordinator,
+    PeerTerminatedError,
+    PeerTimeoutError,
+)
+from app.distributed.testing import MockOOBCoordinator
 
 
 # --- Test classes ---
 
 
-class TestOOBManagerRegistration:
-    """Tests for OOBManager proxy type registration."""
+class TestBarrierHandle:
+    """Tests for BarrierHandle non-blocking barrier tracking."""
 
-    def test_manager_class_exists(self):
-        """OOBManager class is properly defined."""
-        from app.distributed.oob import OOBManager
+    def test_initial_state(self) -> None:
+        """Barrier handle starts incomplete."""
+        handle = BarrierHandle()
+        assert not handle.is_complete()
+        assert not handle._cancelled
 
-        assert issubclass(OOBManager, BaseManager)
+    def test_mark_complete(self) -> None:
+        """Marking complete updates state."""
+        handle = BarrierHandle()
+        handle._mark_complete()
+        assert handle.is_complete()
 
-    def test_get_store_registered(self):
-        """get_store method is registered on OOBManager."""
-        from app.distributed.oob import OOBManager
+    async def test_wait_already_complete(self) -> None:
+        """Wait returns immediately if already complete."""
+        handle = BarrierHandle()
+        handle._mark_complete()
+        await handle.wait(timeout=0.1)  # Should not timeout
 
-        # Check the method is in _registry (BaseManager internal)
-        assert "get_store" in OOBManager._registry
+    async def test_wait_timeout(self) -> None:
+        """Wait raises PeerTimeoutError on timeout."""
+        handle = BarrierHandle()
+        with pytest.raises(PeerTimeoutError):
+            await handle.wait(timeout=0.01)
 
-    def test_get_barrier_registered(self):
-        """get_barrier method is registered on OOBManager."""
-        from app.distributed.oob import OOBManager
+    async def test_wait_concurrent_completion(self) -> None:
+        """Wait succeeds when completed by another task."""
+        handle = BarrierHandle()
 
-        assert "get_barrier" in OOBManager._registry
+        async def complete_later() -> None:
+            await asyncio.sleep(0.05)
+            handle._mark_complete()
 
+        task = asyncio.create_task(complete_later())
+        await handle.wait(timeout=1.0)
+        assert handle.is_complete()
+        await task
 
-class TestOOBCoordinatorSingleProcess:
-    """Tests for OOBCoordinator in single-process mode (rank 0 only)."""
-
-    def test_coordinator_init_rank0(self):
-        """Rank 0 successfully starts server and connects as client."""
-        from app.distributed.oob import OOBCoordinator
-
-        port = _find_free_port()
-        coord = OOBCoordinator(
-            rank=0,
-            world_size=1,
-            host="127.0.0.1",
-            port=port,
-            authkey=b"test",
-            timeout_sec=5.0,
-        )
-
-        # Should have both server and client manager
-        assert coord._server_manager is not None
-        assert coord._manager is not None
-        assert coord._store is not None
-        assert coord._barrier is not None
-
-    def test_store_operations_single_rank(self):
-        """Dict proxy operations work for single rank."""
-        from app.distributed.oob import OOBCoordinator
-
-        port = _find_free_port()
-        coord = OOBCoordinator(
-            rank=0,
-            world_size=1,
-            host="127.0.0.1",
-            port=port,
-            authkey=b"test",
-        )
-
-        # Test __setitem__ and __getitem__
-        coord._store["test_key"] = "test_value"
-        assert coord._store["test_key"] == "test_value"
-
-        # Test __contains__
-        assert "test_key" in coord._store
-        assert "nonexistent" not in coord._store
-
-        # Test get with default
-        assert coord._store.get("test_key") == "test_value"
-        assert coord._store.get("missing", "default") == "default"
-
-    def test_signal_ready(self):
-        """signal_ready stores the expected key."""
-        from app.distributed.oob import OOBCoordinator
-
-        port = _find_free_port()
-        coord = OOBCoordinator(
-            rank=0,
-            world_size=1,
-            host="127.0.0.1",
-            port=port,
-            authkey=b"test",
-        )
-
-        coord.signal_ready("transfer_123")
-        assert "ready_transfer_123_rank0" in coord._store
-
-    def test_signal_complete(self):
-        """signal_complete stores the expected key."""
-        from app.distributed.oob import OOBCoordinator
-
-        port = _find_free_port()
-        coord = OOBCoordinator(
-            rank=0,
-            world_size=1,
-            host="127.0.0.1",
-            port=port,
-            authkey=b"test",
-        )
-
-        coord.signal_complete("transfer_456")
-        assert "complete_transfer_456_rank0" in coord._store
+    def test_cancel(self) -> None:
+        """Cancel sets cancelled flag."""
+        handle = BarrierHandle()
+        handle.cancel()
+        assert handle._cancelled
 
 
-class TestOOBCoordinatorTwoProcess:
-    """Integration tests with two processes simulating distributed ranks.
+class TestOOBCoordinatorUnit:
+    """Unit tests for OOBCoordinator that don't require network."""
 
-    These tests use multiprocessing with fork context to spawn a worker
-    process that acts as rank 1, while the main process acts as rank 0.
-    """
+    def test_initialization(self) -> None:
+        """Coordinator initializes with correct state."""
+        coord = OOBCoordinator(rank=0, world_size=2, host="127.0.0.1", port=29400)
 
-    @pytest.fixture
-    def mp_context(self):
-        """Get fork context for multiprocessing (avoids pickle issues)."""
-        return multiprocessing.get_context("fork")
+        assert coord.rank == 0
+        assert coord.world_size == 2
+        assert coord.host == "127.0.0.1"
+        assert coord.port == 29400
+        assert coord._timeout_sec == 300.0
+        assert not coord._shutdown
+        assert not coord._abort_flag
+        assert len(coord._terminating_ranks) == 0
 
-    def test_two_process_store_and_barrier(self, mp_context):
-        """Two processes can share dict and synchronize via barrier."""
-        from app.distributed.oob import OOBCoordinator
+    def test_initialization_worker(self) -> None:
+        """Worker initializes with correct state."""
+        coord = OOBCoordinator(rank=1, world_size=2, host="192.168.1.1", port=29400)
 
-        port = _find_free_port()
+        assert coord.rank == 1
+        assert coord.world_size == 2
+        assert coord.host == "192.168.1.1"
 
-        # Run rank 1 in subprocess using fork context
-        p = mp_context.Process(target=_rank1_store_barrier_worker, args=(port,))
-        p.start()
+    def test_is_any_peer_terminating_empty(self) -> None:
+        """No termination when set is empty."""
+        coord = OOBCoordinator(rank=0, world_size=2, host="127.0.0.1")
+        assert not coord.is_any_peer_terminating()
 
-        # Run rank 0 in main process
-        coord = OOBCoordinator(
-            rank=0,
-            world_size=2,
-            host="127.0.0.1",
-            port=port,
-            authkey=b"test",
-            timeout_sec=10.0,
-        )
+    def test_is_any_peer_terminating_self(self) -> None:
+        """Self-termination doesn't count as peer termination."""
+        coord = OOBCoordinator(rank=0, world_size=2, host="127.0.0.1")
+        coord._terminating_ranks.add(0)  # Self
+        assert not coord.is_any_peer_terminating()
 
-        # Set our ready key
-        coord._store["rank0_ready"] = "1"
+    def test_is_any_peer_terminating_peer(self) -> None:
+        """Peer termination detected."""
+        coord = OOBCoordinator(rank=0, world_size=2, host="127.0.0.1")
+        coord._terminating_ranks.add(1)  # Peer
+        assert coord.is_any_peer_terminating()
 
-        # Wait for rank 1
-        t0 = time.time()
-        while "rank1_ready" not in coord._store:
-            if time.time() - t0 > 10:
-                p.terminate()
-                pytest.fail("Rank 1 never set ready key")
-            time.sleep(0.01)
+    def test_check_peers_alive_healthy(self) -> None:
+        """check_peers_alive returns True when healthy."""
+        coord = OOBCoordinator(rank=0, world_size=2, host="127.0.0.1")
+        assert coord.check_peers_alive()
 
-        # Barrier should pass quickly since rank 1 is ready
-        coord.barrier("test_barrier")
+    def test_check_peers_alive_shutdown(self) -> None:
+        """check_peers_alive returns False when shutdown."""
+        coord = OOBCoordinator(rank=0, world_size=2, host="127.0.0.1")
+        coord._shutdown = True
+        assert not coord.check_peers_alive()
 
-        # Wait for rank 1 to finish
-        p.join(timeout=15)
+    def test_check_peers_alive_aborted(self) -> None:
+        """check_peers_alive returns False when aborted."""
+        coord = OOBCoordinator(rank=0, world_size=2, host="127.0.0.1")
+        coord._abort_flag = True
+        assert not coord.check_peers_alive()
 
-        assert p.exitcode == 0, f"Rank 1 failed with exit code {p.exitcode}"
+    def test_check_abort_or_termination_clean(self) -> None:
+        """No exception when state is clean."""
+        coord = OOBCoordinator(rank=0, world_size=2, host="127.0.0.1")
+        coord._check_abort_or_termination("test")  # Should not raise
 
-    def test_wait_ready_blocks_until_signal(self, mp_context):
-        """wait_ready correctly blocks until signal_ready is called."""
-        from app.distributed.oob import OOBCoordinator
+    def test_check_abort_or_termination_abort(self) -> None:
+        """Raises AbortError when aborted."""
+        coord = OOBCoordinator(rank=0, world_size=2, host="127.0.0.1")
+        coord._abort_flag = True
 
-        port = _find_free_port()
+        with pytest.raises(AbortError) as exc_info:
+            coord._check_abort_or_termination("test_op")
+        assert "test_op" in str(exc_info.value)
 
-        # Run rank 1 in subprocess
-        p = mp_context.Process(target=_rank1_wait_ready_worker, args=(port,))
-        p.start()
+    def test_check_abort_or_termination_terminated(self) -> None:
+        """Raises PeerTerminatedError when peer terminated."""
+        coord = OOBCoordinator(rank=0, world_size=2, host="127.0.0.1")
+        coord._terminating_ranks.add(1)
 
-        # Run rank 0 in main process
-        coord = OOBCoordinator(
-            rank=0,
-            world_size=2,
-            host="127.0.0.1",
-            port=port,
-            authkey=b"test",
-        )
+        with pytest.raises(PeerTerminatedError) as exc_info:
+            coord._check_abort_or_termination("test_op")
+        assert "test_op" in str(exc_info.value)
 
-        # Delay before signaling ready - rank 1 should block during this time
-        time.sleep(0.5)
-        signal_time = time.time()
-        coord.signal_ready("transfer_test")
 
-        # Wait for rank 1 to complete
-        t0 = time.time()
-        while "rank1_done" not in coord._store:
-            if time.time() - t0 > 10:
-                p.terminate()
-                pytest.fail("Rank 1 never completed")
-            time.sleep(0.01)
+class TestMockOOBCoordinator:
+    """Tests for MockOOBCoordinator test helper."""
 
-        wait_complete_time = time.time()
+    async def test_barrier_tracking(self) -> None:
+        """Mock tracks barrier calls."""
+        oob = MockOOBCoordinator(rank=0, world_size=2)
 
-        p.join(timeout=5)
+        await oob.barrier("test_barrier")
 
-        # Verify wait_ready actually blocked (completed after signal)
-        # Allow some slack for process timing
-        assert wait_complete_time >= signal_time - 0.1
-        assert p.exitcode == 0
+        oob.assert_barrier_entered("test_barrier")
+        assert "test_barrier" in oob.barriers_entered
+
+    async def test_barrier_not_entered_assertion(self) -> None:
+        """Assert barrier not entered works correctly."""
+        oob = MockOOBCoordinator(rank=0, world_size=2)
+
+        oob.assert_barrier_not_entered("never_called")
+
+        await oob.barrier("called")
+        with pytest.raises(AssertionError):
+            oob.assert_barrier_not_entered("called")
+
+    async def test_ready_signal_tracking(self) -> None:
+        """Mock tracks ready signals."""
+        oob = MockOOBCoordinator(rank=1, world_size=2)
+
+        await oob.signal_ready("transfer_123")
+
+        oob.assert_ready_signaled("transfer_123")
+        assert oob.ready_signals["transfer_123"] == 1
+
+    async def test_complete_signal_tracking(self) -> None:
+        """Mock tracks complete signals."""
+        oob = MockOOBCoordinator(rank=0, world_size=2)
+
+        await oob.signal_complete("transfer_456")
+
+        oob.assert_complete_signaled("transfer_456")
+        assert oob.complete_signals["transfer_456"] == 0
+
+    async def test_peer_termination_simulation(self) -> None:
+        """Mock simulates peer termination."""
+        oob = MockOOBCoordinator(rank=0, world_size=2)
+
+        assert not oob.is_any_peer_terminating()
+        assert oob.check_peers_alive()
+
+        oob.simulate_peer_termination()
+
+        assert oob.is_any_peer_terminating()
+        assert not oob.check_peers_alive()
+
+        with pytest.raises(PeerTerminatedError):
+            await oob.barrier("should_fail")
+
+    async def test_peer_termination_reset(self) -> None:
+        """Mock can reset peer termination."""
+        oob = MockOOBCoordinator(rank=0, world_size=2)
+        oob.simulate_peer_termination()
+
+        oob.reset_peer_termination()
+
+        assert not oob.is_any_peer_terminating()
+        await oob.barrier("should_succeed")
+
+    async def test_abort_simulation(self) -> None:
+        """Mock simulates abort signal."""
+        oob = MockOOBCoordinator(rank=0, world_size=2)
+
+        await oob.abort()
+
+        with pytest.raises(AbortError):
+            await oob.barrier("should_fail")
+
+    async def test_abort_reset(self) -> None:
+        """Mock can reset abort flag."""
+        oob = MockOOBCoordinator(rank=0, world_size=2)
+        oob.simulate_abort()
+
+        oob.reset_abort()
+
+        await oob.barrier("should_succeed")
+
+    async def test_wait_ready_with_termination(self) -> None:
+        """wait_ready raises on peer termination."""
+        oob = MockOOBCoordinator(rank=0, world_size=2)
+        oob.simulate_peer_termination()
+
+        with pytest.raises(PeerTerminatedError):
+            await oob.wait_ready("transfer", receiver_rank=1)
+
+    async def test_wait_complete_with_abort(self) -> None:
+        """wait_complete raises on abort."""
+        oob = MockOOBCoordinator(rank=0, world_size=2)
+        oob.simulate_abort()
+
+        with pytest.raises(AbortError):
+            await oob.wait_complete("transfer", sender_rank=1)
+
+    async def test_clear_tracking(self) -> None:
+        """clear_tracking resets all state."""
+        oob = MockOOBCoordinator(rank=0, world_size=2)
+        await oob.barrier("test")
+        await oob.signal_ready("xfer")
+        await oob.signal_complete("xfer")
+        oob.simulate_peer_termination()
+        oob.simulate_abort()
+
+        oob.clear_tracking()
+
+        assert len(oob.barriers_entered) == 0
+        assert len(oob.ready_signals) == 0
+        assert len(oob.complete_signals) == 0
+        assert not oob.is_any_peer_terminating()
+        assert not oob._abort_flag
+
+    async def test_context_manager(self) -> None:
+        """Mock works as async context manager."""
+        async with MockOOBCoordinator(rank=0, world_size=2) as oob:
+            await oob.barrier("in_context")
+            oob.assert_barrier_entered("in_context")
+
+
+class TestExceptionTypes:
+    """Tests for exception classes."""
+
+    def test_peer_timeout_error(self) -> None:
+        """PeerTimeoutError has correct message."""
+        err = PeerTimeoutError("Barrier 'test' timed out")
+        assert "timed out" in str(err)
+
+    def test_peer_terminated_error(self) -> None:
+        """PeerTerminatedError has correct message."""
+        err = PeerTerminatedError("Peer rank 1 terminated")
+        assert "terminated" in str(err)
+
+    def test_abort_error(self) -> None:
+        """AbortError has correct message."""
+        err = AbortError("Abort during barrier")
+        assert "Abort" in str(err)
+
+    def test_exception_inheritance(self) -> None:
+        """All exceptions inherit from Exception."""
+        assert issubclass(PeerTimeoutError, Exception)
+        assert issubclass(PeerTerminatedError, Exception)
+        assert issubclass(AbortError, Exception)
 
 
 class TestDeriveAuthkey:
     """Tests for hostfile-based authkey derivation."""
 
-    def test_derive_authkey_deterministic(self):
+    def test_derive_authkey_deterministic(self) -> None:
         """Same hostfile content produces same authkey."""
         from app.distributed.hostfile import HostConfig, derive_authkey
 
@@ -295,7 +316,7 @@ class TestDeriveAuthkey:
         assert key1 == key2
         assert len(key1) == 16  # SHA256 truncated to 16 bytes
 
-    def test_derive_authkey_different_hostfiles(self):
+    def test_derive_authkey_different_hostfiles(self) -> None:
         """Different hostfile content produces different authkeys."""
         from app.distributed.hostfile import HostConfig, derive_authkey
 
@@ -313,7 +334,7 @@ class TestDeriveAuthkey:
 
         assert key1 != key2
 
-    def test_derive_authkey_order_matters(self):
+    def test_derive_authkey_order_matters(self) -> None:
         """Host order affects authkey (prevents rank mismatch)."""
         from app.distributed.hostfile import HostConfig, derive_authkey
 
@@ -335,65 +356,13 @@ class TestDeriveAuthkey:
 class TestInitOOB:
     """Tests for the init_oob convenience function."""
 
-    def test_init_oob_returns_coordinator(self):
-        """init_oob returns an OOBCoordinator instance."""
+    async def test_get_oob_before_init(self) -> None:
+        """get_oob returns None before initialization."""
         import app.distributed.oob as oob_module
-        from app.distributed.oob import init_oob
 
         # Reset global state
         oob_module._oob_coordinator = None
 
-        port = _find_free_port()
-        coord = init_oob(
-            rank=0,
-            world_size=1,
-            host="127.0.0.1",
-            port=port,
-            authkey=b"test",
-        )
+        from app.distributed.oob import get_oob
 
-        assert coord is not None
-        assert coord.rank == 0
-        assert coord.world_size == 1
-
-        # Clean up global state
-        oob_module._oob_coordinator = None
-
-    def test_init_oob_returns_existing_on_reinit(self):
-        """Calling init_oob twice returns the same instance."""
-        import app.distributed.oob as oob_module
-        from app.distributed.oob import init_oob
-
-        # Reset global state
-        oob_module._oob_coordinator = None
-
-        port = _find_free_port()
-        coord1 = init_oob(rank=0, world_size=1, host="127.0.0.1", port=port)
-
-        # Second call should return same instance (with warning)
-        coord2 = init_oob(rank=0, world_size=1, host="127.0.0.1", port=port + 1)
-
-        assert coord1 is coord2
-
-        # Clean up
-        oob_module._oob_coordinator = None
-
-    def test_get_oob_returns_global_coordinator(self):
-        """get_oob returns the globally initialized coordinator."""
-        import app.distributed.oob as oob_module
-        from app.distributed.oob import get_oob, init_oob
-
-        # Reset global state
-        oob_module._oob_coordinator = None
-
-        # Before init, should be None
         assert get_oob() is None
-
-        port = _find_free_port()
-        coord = init_oob(rank=0, world_size=1, host="127.0.0.1", port=port)
-
-        # After init, should return coordinator
-        assert get_oob() is coord
-
-        # Clean up
-        oob_module._oob_coordinator = None
