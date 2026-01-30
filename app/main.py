@@ -175,9 +175,37 @@ async def start(config: MLXServerConfig) -> None:
             # Without this, the first all_sum in sync_metadata_to_workers can hang
             # if JACCL hasn't completed internal setup on both sides.
             logger.info(f"[Rank {rank}] Running JACCL warmup barrier...")
-            warmup = mx.distributed.all_sum(mx.array([rank], dtype=mx.int32), group=group)
+
+            # Diagnostic: dump JACCL-relevant state
+            ibv_path = os.environ.get('MLX_IBV_DEVICES')
+            ibv_content = "N/A"
+            if ibv_path:
+                try:
+                    with open(ibv_path) as f:
+                        ibv_content = f.read().strip()
+                except Exception as e:
+                    ibv_content = f"error: {e}"
+            logger.info(f"[Rank {rank}] JACCL env: MLX_RANK={os.environ.get('MLX_RANK')}, "
+                       f"MLX_WORLD_SIZE={os.environ.get('MLX_WORLD_SIZE')}, "
+                       f"MLX_JACCL_COORDINATOR={os.environ.get('MLX_JACCL_COORDINATOR')}, "
+                       f"MLX_IBV_DEVICES={ibv_path}")
+            logger.info(f"[Rank {rank}] IBV devices content: {ibv_content}")
+            logger.info(f"[Rank {rank}] Group info: rank()={group.rank()}, size()={group.size()}")
+
+            # Create input array and log it
+            warmup_input = mx.array([rank], dtype=mx.int32)
+            mx.eval(warmup_input)
+            logger.info(f"[Rank {rank}] Warmup input: {warmup_input.tolist()}, dtype={warmup_input.dtype}")
+
+            # Run all_sum
+            warmup = mx.distributed.all_sum(warmup_input, group=group)
             mx.eval(warmup)
-            logger.info(f"[Rank {rank}] JACCL warmup complete (sum={warmup[0].item()})")
+
+            # Log result details
+            result_val = warmup[0].item()
+            logger.info(f"[Rank {rank}] JACCL warmup complete: sum={result_val} "
+                       f"(expected {world_size * (world_size - 1) // 2}), "  # 0+1+...+(n-1)
+                       f"raw={warmup.tolist()}, dtype={warmup.dtype}")
 
             # Initialize OOB for mlx.launch mode. Skip if already initialized via hostfile.
             # Only JACCL needs OOB - Ring has implicit sync, MPI has built-in rendezvous.
