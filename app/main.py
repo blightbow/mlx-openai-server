@@ -22,11 +22,46 @@ Distributed inference (via mlx.launch):
         python -m app.main launch --model-path <model> --distributed=tensor
 """
 
+import atexit
 import os
+import signal
 import sys
 
 import uvicorn
 from loguru import logger
+
+
+# Global reference to distributed group for cleanup
+_distributed_group = None
+
+
+def _jaccl_cleanup():
+    """Attempt to clean up JACCL state on exit.
+
+    JACCL doesn't expose a finalize() API, but we can try to:
+    1. Synchronize any pending operations
+    2. Clear the MLX cache
+
+    This may help reduce corruption from ungraceful termination.
+    """
+    global _distributed_group
+    if _distributed_group is not None:
+        try:
+            import mlx.core as mx
+            # Try to drain any pending operations
+            mx.synchronize()
+            mx.clear_cache()
+            logger.debug("JACCL cleanup: synchronized and cleared cache")
+        except Exception as e:
+            logger.debug(f"JACCL cleanup failed (expected on crash): {e}")
+
+
+def _signal_handler(signum, frame):
+    """Handle termination signals gracefully."""
+    sig_name = signal.Signals(signum).name
+    logger.info(f"Received {sig_name}, attempting graceful shutdown...")
+    _jaccl_cleanup()
+    sys.exit(0)
 
 from .config import MLXServerConfig
 from .server import setup_server
@@ -170,6 +205,14 @@ async def start(config: MLXServerConfig) -> None:
             rank = group.rank()
             world_size = group.size()
             logger.info(f"[Rank {rank}] Distributed group initialized: size={world_size}")
+
+            # Register cleanup handlers to reduce JACCL corruption from ungraceful termination
+            global _distributed_group
+            _distributed_group = group
+            atexit.register(_jaccl_cleanup)
+            signal.signal(signal.SIGINT, _signal_handler)
+            signal.signal(signal.SIGTERM, _signal_handler)
+            logger.debug(f"[Rank {rank}] Registered JACCL cleanup handlers")
 
             # JACCL warmup barrier: ensure backend is fully ready before collective ops.
             # Without this, the first all_sum in sync_metadata_to_workers can hang
