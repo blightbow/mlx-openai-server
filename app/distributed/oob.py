@@ -252,6 +252,9 @@ class OOBCoordinator:
 
         self._tasks.append(asyncio.create_task(self._broadcast_listener()))
 
+        # Give background tasks a chance to start
+        await asyncio.sleep(0)
+
         # Wait for all ranks to connect (simple barrier via store)
         await self._startup_barrier()
 
@@ -496,9 +499,14 @@ class OOBCoordinator:
     async def _barrier_server_loop(self) -> None:
         """Coordinator: Handle barrier arrival requests."""
         logger.info("[Rank 0] Barrier server loop started")
+        loop_count = 0
         while not self._shutdown:
             try:
+                loop_count += 1
+                if loop_count % 100 == 1:  # Log every 10 seconds (100 * 0.1s)
+                    logger.debug(f"[Rank 0] Barrier server loop iteration {loop_count}")
                 msg = await asyncio.wait_for(self._barrier_rep.recv(), timeout=0.1)
+                logger.info(f"[Rank 0] Barrier server received: {msg.decode()}")
                 parts = msg.decode().split(":")
 
                 if parts[0] == "ARRIVE" and len(parts) >= 3:
