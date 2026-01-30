@@ -1561,6 +1561,10 @@ def oob_send_file_bytes(
             "Call init_oob() or set MLX_OOB_HOST before using oob_send_file_bytes."
         )
 
+    # Check for peer termination before starting transfer
+    if oob.is_any_peer_terminating():
+        raise RuntimeError("Peer terminated before send could complete")
+
     # Wait for receiver to signal ready
     oob.wait_ready(transfer_id, dst_rank)
 
@@ -1603,6 +1607,10 @@ def oob_recv_file_bytes(
             "OOB coordinator not initialized. "
             "Call init_oob() or set MLX_OOB_HOST before using oob_recv_file_bytes."
         )
+
+    # Check for peer termination before starting transfer
+    if oob.is_any_peer_terminating():
+        raise RuntimeError("Peer terminated before recv could complete")
 
     # Signal we're ready to receive
     oob.signal_ready(transfer_id)
@@ -1767,6 +1775,11 @@ def make_distributed_weight_loader(
         # OOB barrier: verify all ranks are in sync before each file transfer.
         # Lighter than all_sum - uses TCPStore key exchange, no data transfer.
         oob.barrier(f"file_{file_num}")
+
+        # Check if any peer is terminating before starting RDMA transfer
+        if oob.is_any_peer_terminating():
+            logger.warning(f"[Rank {rank}] Peer terminating, aborting weight transfer")
+            raise RuntimeError("Peer terminated during weight transfer")
 
         # Determine who needs this file
         r0_needs = rank0_files is None or file_name in rank0_files

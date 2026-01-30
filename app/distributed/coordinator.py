@@ -196,6 +196,13 @@ def run_worker_loop(
 
     while True:
         try:
+            # Check if coordinator is terminating before blocking on all_sum
+            from .oob import get_oob
+            oob = get_oob()
+            if oob is not None and oob.is_any_peer_terminating():
+                logger.info(f"[Rank {rank}] Coordinator is terminating, exiting worker loop")
+                return
+
             # all_sum broadcast: we contribute zeros, coordinator contributes data.
             # See module docstring for why we use all_sum() instead of recv_like().
             logger.debug(f"[Rank {rank}] Waiting for token length...")
