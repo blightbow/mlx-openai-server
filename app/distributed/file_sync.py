@@ -1816,7 +1816,7 @@ async def make_distributed_weight_loader(
         >>> loader = await make_distributed_weight_loader(group, model_path, "pipeline")
         >>> model, tokenizer = load(model_path, weight_loader=loader)
     """
-    from .oob import get_oob
+    from .oob import get_oob, oob_barrier_sync
 
     rank = group.rank()
     world_size = group.size()
