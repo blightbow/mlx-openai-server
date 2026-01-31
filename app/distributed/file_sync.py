@@ -2117,6 +2117,8 @@ async def validate_memory_for_streaming(
     world_size = group.size()
     chunk_size = get_chunk_size()
 
+    logger.info(f"{get_node_prefix(rank)} validate_memory_for_streaming: entering")
+
     # Get OOB coordinator for synchronization
     oob = get_oob()
     if oob is None:
@@ -2124,6 +2126,8 @@ async def validate_memory_for_streaming(
             "OOB coordinator not initialized. Call init_oob() before "
             "validate_memory_for_streaming(). See oob.py for details."
         )
+
+    logger.info(f"{get_node_prefix(rank)} validate_memory_for_streaming: OOB coordinator OK")
 
     # Rank 0 reads manifest and sends sizes to workers
     if rank == 0:
@@ -2153,6 +2157,7 @@ async def validate_memory_for_streaming(
     else:
         # Workers receive size info via OOB-coordinated recv
         transfer_id = f"memory_validation_to_rank{rank}"
+        logger.info(f"{get_node_prefix(rank)} validate_memory_for_streaming: receiving sizes from rank 0")
         sizes_bytes = await oob_recv_file_bytes_async(group, src_rank=0, transfer_id=transfer_id,
                                                        chunk_size=chunk_size)
         sizes_data = json.loads(sizes_bytes.decode("utf-8"))

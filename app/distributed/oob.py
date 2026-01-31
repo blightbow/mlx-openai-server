@@ -586,16 +586,22 @@ class OOBCoordinator:
 
     async def _store_server_loop(self) -> None:
         """Coordinator: Handle store requests from workers."""
+        logger.debug("[Rank 0] Store server loop starting")
+        msg_count = 0
         while not self._shutdown:
             try:
                 msg = await asyncio.wait_for(self._store_rep.recv(), timeout=0.1)
+                msg_count += 1
                 parts = msg.decode().split(":", 2)
                 cmd = parts[0]
+                logger.info(f"[Rank 0] Store server received msg #{msg_count}: {cmd} (parts={len(parts)})")
 
                 if cmd == "SET" and len(parts) >= 3:
                     key, value = parts[1], parts[2]
                     self._store[key] = value
+                    logger.info(f"[Rank 0] Store server SET {key}={value}, sending OK")
                     await self._store_rep.send(b"OK")
+                    logger.debug(f"[Rank 0] Store server SET {key} OK sent")
 
                 elif cmd == "GET" and len(parts) >= 2:
                     key = parts[1]
@@ -650,11 +656,16 @@ class OOBCoordinator:
         """Set a key in the store."""
         if self.rank == 0:
             self._store[key] = value
+            logger.debug(f"[Rank 0] Store SET local: {key}={value}")
         else:
+            logger.info(f"[Rank {self.rank}] Store SET acquiring lock for {key}")
             async with self._store_lock:
                 msg = f"SET:{key}:{value}".encode()
+                logger.info(f"[Rank {self.rank}] Store SET sending: {key}")
                 await self._store_req.send(msg)
+                logger.info(f"[Rank {self.rank}] Store SET waiting for reply: {key}")
                 await self._store_req.recv()
+                logger.info(f"[Rank {self.rank}] Store SET complete: {key}")
 
     async def _store_get(self, key: str) -> str:
         """Get a value from the store."""
@@ -716,15 +727,19 @@ class OOBCoordinator:
             timeout = self._timeout_sec
 
         key = f"ready_{transfer_id}_rank{receiver_rank}"
-        logger.debug(
-            f"[Rank {self.rank}] Waiting for rank {receiver_rank} "
-            f"to be ready for transfer {transfer_id} (timeout={timeout}s)"
+        logger.info(
+            f"[Rank {self.rank}] wait_ready: waiting for rank {receiver_rank} "
+            f"ready signal for {transfer_id}"
         )
 
         deadline = time.time() + timeout
         poll_interval = 0.01  # 10ms between checks
+        check_count = 0
 
         while not await self._store_exists(key):
+            check_count += 1
+            if check_count % 100 == 0:  # Log every 100 checks (~1 second)
+                logger.info(f"[Rank {self.rank}] wait_ready: still waiting for {key} (check #{check_count})")
             self._check_abort_or_termination(f"wait_ready {transfer_id}")
 
             if time.time() >= deadline:
