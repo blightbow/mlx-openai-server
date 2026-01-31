@@ -335,14 +335,20 @@ class OOBCoordinator:
         sock.setsockopt(zmq.RCVBUF, 4096)
 
     async def _startup_barrier(self) -> None:
-        """Simple startup synchronization using store.
+        """Startup synchronization using store + barrier.
 
-        Uses two-phase handshake to ensure all ranks complete before any returns:
+        Uses three-phase handshake to ensure all ranks complete before any returns:
         1. Phase 1: Each rank sets presence key, waits for all presence keys
         2. Phase 2: Each rank sets complete key, waits for all complete keys
+        3. Phase 3: Actual barrier to sync before exit
 
-        This prevents the coordinator from proceeding to blocking operations
-        (like mx.distributed.init) while workers are still querying the store.
+        Phase 3 is critical because phases 1-2 have an asymmetry: Rank 0's store
+        checks are local (instant) while workers go through sockets. Without
+        phase 3, Rank 0 can exit and block the event loop (e.g., in
+        mx.distributed.init) while workers are still waiting for socket responses.
+
+        Phase 3 uses the barrier mechanism which keeps Rank 0 yielding while
+        waiting for worker arrivals, allowing the store server to respond.
         """
         # Phase 1: Signal presence and wait for all ranks
         key = f"startup_rank{self.rank}"
@@ -393,6 +399,13 @@ class OOBCoordinator:
                 )
 
         logger.debug(f"[Rank {self.rank}] Startup phase 2 complete")
+
+        # Phase 3: Use actual barrier mechanism for final sync
+        # This is critical: the barrier coordinator (rank 0) yields while waiting
+        # for worker arrivals, allowing the store server to respond to any
+        # pending requests from workers still finishing phase 2.
+        await self.barrier("startup_final", timeout=self._timeout_sec)
+        logger.debug(f"[Rank {self.rank}] Startup phase 3 (barrier) complete")
 
     async def stop(self) -> None:
         """Stop the OOB coordinator gracefully."""
