@@ -1,0 +1,22 @@
+[
+    {
+        "ssh": "misha.local",
+        "ips": [
+            "192.168.1.45"
+        ],
+        "rdma": [
+            null,
+            "rdma_en2"
+        ]
+    },
+    {
+        "ssh": "sasha.local",
+        "ips": [
+            "192.168.1.44"
+        ],
+        "rdma": [
+            "rdma_en2",
+            null
+        ]
+    }
+]

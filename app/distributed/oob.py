@@ -586,9 +586,14 @@ class OOBCoordinator:
 
     async def _store_server_loop(self) -> None:
         """Coordinator: Handle store requests from workers."""
-        logger.debug("[Rank 0] Store server loop starting")
+        logger.info("[Rank 0] Store server loop starting")
         msg_count = 0
+        loop_count = 0
         while not self._shutdown:
+            loop_count += 1
+            # Log every 100 iterations to show loop is alive
+            if loop_count % 100 == 0:
+                logger.info(f"[Rank 0] Store server loop iteration #{loop_count} (msgs received: {msg_count})")
             try:
                 msg = await asyncio.wait_for(self._store_rep.recv(), timeout=0.1)
                 msg_count += 1

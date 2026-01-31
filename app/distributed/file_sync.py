@@ -1618,10 +1618,6 @@ async def oob_send_file_bytes_async(
     """Async version: Send bytes with OOB receiver-initiated rendezvous.
 
     Use this from async contexts (e.g., main.py startup).
-
-    Uses a barrier between OOB signaling and actual send/recv to prevent
-    JACCL timing issues. Without this barrier, Rank 0 might start sending
-    before Rank 1 has posted its receive buffer, causing data loss.
     """
     from .oob import get_oob
 
@@ -1636,14 +1632,13 @@ async def oob_send_file_bytes_async(
         raise RuntimeError("Peer terminated before send could complete")
 
     # Wait for receiver to signal ready
+    logger.info(f"[Rank {oob.rank}] oob_send: waiting for receiver ready signal")
     await oob.wait_ready(transfer_id, dst_rank)
+    logger.info(f"[Rank {oob.rank}] oob_send: receiver ready, sending data")
 
-    # Barrier ensures both ranks proceed to send/recv together.
-    # Without this, sender might send before receiver has posted its buffer.
-    await oob.barrier(f"xfer_sync_{transfer_id}")
-
-    # Now safe to send - receiver is also past barrier and will post recv
+    # Now safe to send - receiver has posted recv
     send_file_bytes(data, group, dst_rank, chunk_size, log_file)
+    logger.info(f"[Rank {oob.rank}] oob_send: send complete, signaling completion")
 
     # Signal completion
     await oob.signal_complete(transfer_id)
@@ -1688,12 +1683,7 @@ def oob_send_file_bytes(
     # Wait for receiver to signal ready
     oob_wait_ready_sync(transfer_id, dst_rank)
 
-    # Barrier ensures both ranks proceed to send/recv together.
-    # Without this, sender might send before receiver has posted its buffer.
-    from .oob import oob_barrier_sync
-    oob_barrier_sync(f"xfer_sync_{transfer_id}")
-
-    # Now safe to send - receiver is also past barrier and will post recv
+    # Now safe to send - receiver has posted recv
     send_file_bytes(data, group, dst_rank, chunk_size, log_file)
 
     # Signal completion
@@ -1710,10 +1700,6 @@ async def oob_recv_file_bytes_async(
     """Async version: Receive bytes with OOB receiver-initiated rendezvous.
 
     Use this from async contexts (e.g., main.py startup).
-
-    Uses a barrier between OOB signaling and actual send/recv to prevent
-    JACCL timing issues. Without this barrier, the sender might start
-    before the receiver has posted its buffer, causing data loss.
     """
     from .oob import get_oob
 
@@ -1728,14 +1714,13 @@ async def oob_recv_file_bytes_async(
         raise RuntimeError("Peer terminated before recv could complete")
 
     # Signal we're ready to receive
+    logger.info(f"[Rank {oob.rank}] oob_recv: signaling ready")
     await oob.signal_ready(transfer_id)
+    logger.info(f"[Rank {oob.rank}] oob_recv: ready signaled, receiving data")
 
-    # Barrier ensures both ranks proceed to send/recv together.
-    # Without this, sender might send before we've posted our buffer.
-    await oob.barrier(f"xfer_sync_{transfer_id}")
-
-    # Receive the data - sender is also past barrier and will send
+    # Receive the data
     result = recv_file_bytes(group, src_rank, chunk_size, log_file)
+    logger.info(f"[Rank {oob.rank}] oob_recv: receive complete, waiting for sender completion")
 
     # Wait for sender to confirm completion
     await oob.wait_complete(transfer_id, src_rank)
@@ -1783,12 +1768,7 @@ def oob_recv_file_bytes(
     # Signal we're ready to receive
     oob_signal_ready_sync(transfer_id)
 
-    # Barrier ensures both ranks proceed to send/recv together.
-    # Without this, sender might send before we've posted our buffer.
-    from .oob import oob_barrier_sync
-    oob_barrier_sync(f"xfer_sync_{transfer_id}")
-
-    # Receive the data - sender is also past barrier and will send
+    # Receive the data
     result = recv_file_bytes(group, src_rank, chunk_size, log_file)
 
     # Wait for sender to confirm completion
