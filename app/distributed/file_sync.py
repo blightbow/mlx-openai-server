@@ -1403,6 +1403,19 @@ def broadcast_file_bytes(
         return output
 
 
+def _get_send_function():
+    """Get the appropriate send function, bypassing JACCL patch if active.
+
+    File transfers have their own OOB coordination (signal_ready/wait_complete),
+    so they must bypass the JACCL patch's barrier coordination to avoid deadlock.
+    The patch is designed for model inference (lazy tensor loading), not raw byte transfers.
+    """
+    from . import jaccl_patch
+    if jaccl_patch.is_patched() and jaccl_patch._original_send is not None:
+        return jaccl_patch._original_send
+    return mx.distributed.send
+
+
 def send_file_bytes(
     data: bytes,
     group: mx.distributed.Group,
@@ -1413,6 +1426,10 @@ def send_file_bytes(
     """Send bytes to a specific destination rank via send().
 
     Only called on rank 0. Uses chunked transfer for large data.
+
+    NOTE: Uses the original (unpatched) send when JACCL patch is active.
+    File transfers have their own OOB coordination and don't need the patch's
+    barrier. Using the patched version would cause double coordination deadlock.
 
     Args:
         data: Bytes to send
@@ -1426,6 +1443,9 @@ def send_file_bytes(
     if chunk_size is None:
         chunk_size = get_chunk_size()
 
+    # Get the appropriate send function (original if patch is active)
+    send_fn = _get_send_function()
+
     file_bytes = data
     file_size = len(file_bytes)
 
@@ -1433,7 +1453,7 @@ def send_file_bytes(
     # IMPORTANT: Eval the RESULT of send(), not the input array.
     # send() returns a dependency-tracked array; eval triggers the actual send.
     size_array = mx.array([file_size], dtype=mx.int64)
-    sent_size = mx.distributed.send(size_array, dst_rank, group=group)
+    sent_size = send_fn(size_array, dst_rank, group=group)
     mx.eval(sent_size)
     del size_array, sent_size
 
@@ -1463,7 +1483,7 @@ def send_file_bytes(
 
         chunk = mx.array(padded_buffer)
         # Eval the send result to trigger the actual send
-        sent = mx.distributed.send(chunk, dst_rank, group=group)
+        sent = send_fn(chunk, dst_rank, group=group)
         mx.eval(sent)
 
         bytes_sent += this_chunk_size
@@ -1486,6 +1506,19 @@ def send_file_bytes(
     mx.clear_cache()
 
 
+def _get_recv_like_function():
+    """Get the appropriate recv_like function, bypassing JACCL patch if active.
+
+    File transfers have their own OOB coordination (signal_ready/wait_complete),
+    so they must bypass the JACCL patch's barrier coordination to avoid deadlock.
+    The patch is designed for model inference (lazy tensor loading), not raw byte transfers.
+    """
+    from . import jaccl_patch
+    if jaccl_patch.is_patched() and jaccl_patch._original_recv_like is not None:
+        return jaccl_patch._original_recv_like
+    return mx.distributed.recv_like
+
+
 def recv_file_bytes(
     group: mx.distributed.Group,
     src_rank: int,
@@ -1495,6 +1528,10 @@ def recv_file_bytes(
     """Receive file bytes from a source rank via recv_like().
 
     Only called on non-zero ranks. Uses chunked transfer for large files.
+
+    NOTE: Uses the original (unpatched) recv_like when JACCL patch is active.
+    File transfers have their own OOB coordination and don't need the patch's
+    barrier. Using the patched version would cause double coordination deadlock.
 
     Args:
         group: MLX distributed group
@@ -1510,9 +1547,12 @@ def recv_file_bytes(
     if chunk_size is None:
         chunk_size = get_chunk_size()
 
+    # Get the appropriate recv_like function (original if patch is active)
+    recv_like_fn = _get_recv_like_function()
+
     # Receive file size first
     size_template = mx.zeros((1,), dtype=mx.int64)
-    size_array = mx.distributed.recv_like(size_template, src_rank, group=group)
+    size_array = recv_like_fn(size_template, src_rank, group=group)
     mx.eval(size_array)
     file_size = int(size_array[0].item())
     del size_template, size_array
@@ -1536,7 +1576,7 @@ def recv_file_bytes(
         remaining = file_size - bytes_received
         this_chunk_size = min(chunk_size, remaining)
 
-        result = mx.distributed.recv_like(chunk_template, src_rank, group=group)
+        result = recv_like_fn(chunk_template, src_rank, group=group)
         mx.eval(result)
 
         # Copy into pre-allocated output buffer
