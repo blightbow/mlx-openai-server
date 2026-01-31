@@ -589,13 +589,28 @@ class OOBCoordinator:
         logger.info("[Rank 0] Store server loop starting")
         msg_count = 0
         loop_count = 0
+
+        # Use poller pattern (like barrier server) to avoid asyncio.wait_for
+        # cancellation issues. When wait_for times out, it cancels recv() which
+        # can leave ZMQ socket state inconsistent after event loop blocking.
+        poller = zmq.asyncio.Poller()
+        poller.register(self._store_rep, zmq.POLLIN)
+
         while not self._shutdown:
             loop_count += 1
             # Log every 100 iterations to show loop is alive
             if loop_count % 100 == 0:
                 logger.info(f"[Rank 0] Store server loop iteration #{loop_count} (msgs received: {msg_count})")
             try:
-                msg = await asyncio.wait_for(self._store_rep.recv(), timeout=0.1)
+                # Poll with 100ms timeout - returns when data available or timeout
+                events = dict(await poller.poll(timeout=100))
+
+                if self._store_rep not in events:
+                    # No data available, continue polling
+                    continue
+
+                # Data available - do non-blocking recv (guaranteed to succeed)
+                msg = await self._store_rep.recv(zmq.NOBLOCK)
                 msg_count += 1
                 parts = msg.decode().split(":", 2)
                 cmd = parts[0]
@@ -649,10 +664,11 @@ class OOBCoordinator:
                 else:
                     await self._store_rep.send(b"ERR:UNKNOWN")
 
-            except asyncio.TimeoutError:
-                continue
             except asyncio.CancelledError:
                 break
+            except zmq.Again:
+                # NOBLOCK recv had no data (shouldn't happen after poll, but be safe)
+                continue
             except Exception as e:
                 if not self._shutdown:
                     logger.error(f"[Rank 0] Store server error: {e}")
@@ -820,9 +836,18 @@ class OOBCoordinator:
 
     async def _term_relay_loop(self) -> None:
         """Coordinator: Relay termination signals from workers to broadcast."""
+        # Use poller pattern to avoid asyncio.wait_for cancellation issues
+        poller = zmq.asyncio.Poller()
+        poller.register(self._term_rep, zmq.POLLIN)
+
         while not self._shutdown:
             try:
-                msg = await asyncio.wait_for(self._term_rep.recv(), timeout=0.1)
+                events = dict(await poller.poll(timeout=100))
+
+                if self._term_rep not in events:
+                    continue
+
+                msg = await self._term_rep.recv(zmq.NOBLOCK)
 
                 if msg.startswith(b"TERM:"):
                     # Relay to broadcast
@@ -831,19 +856,28 @@ class OOBCoordinator:
                 else:
                     await self._term_rep.send(b"ERR:UNKNOWN")
 
-            except asyncio.TimeoutError:
-                continue
             except asyncio.CancelledError:
                 break
+            except zmq.Again:
+                continue
             except Exception as e:
                 if not self._shutdown:
                     logger.error(f"[Rank 0] Term relay error: {e}")
 
     async def _broadcast_listener(self) -> None:
         """Listen for broadcast messages (barrier release, termination, abort)."""
+        # Use poller pattern to avoid asyncio.wait_for cancellation issues
+        poller = zmq.asyncio.Poller()
+        poller.register(self._sub, zmq.POLLIN)
+
         while not self._shutdown:
             try:
-                msg = await asyncio.wait_for(self._sub.recv(), timeout=0.1)
+                events = dict(await poller.poll(timeout=100))
+
+                if self._sub not in events:
+                    continue
+
+                msg = await self._sub.recv(zmq.NOBLOCK)
 
                 if msg.startswith(b"RELEASE:"):
                     # Barrier release
@@ -863,10 +897,10 @@ class OOBCoordinator:
                     self._abort_flag = True
                     logger.warning(f"[Rank {self.rank}] Received abort signal")
 
-            except asyncio.TimeoutError:
-                continue
             except asyncio.CancelledError:
                 break
+            except zmq.Again:
+                continue
             except Exception as e:
                 if not self._shutdown:
                     logger.debug(f"[Rank {self.rank}] Broadcast listener: {e}")
